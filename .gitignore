@@ -1,0 +1,26 @@
+# Виртуальные окружения
+.venv/
+.venv-test/
+venv/
+env/
+
+# Кэш Python и тестов
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Логи и базы данных
+*.log
+.pre-commit-config.yaml
+.env
+
+# Специфичные файлы вашей ML-модели
+artifacts/
+*.pt
+*.onnx
+*.pkl
+
+# Системные файлы
+.DS_Store
