@@ -1,0 +1,102 @@
+# =============================================================================
+# A.E. Brain local infrastructure
+#
+#   docker compose up -d                # Postgres + RabbitMQ only (no GPU needed)
+#   docker compose --profile app up -d  # also build + run the GPU app service
+#   docker compose run --rm ae-brain train all --data /app/data/candles.csv
+#
+# The `ae-brain` app service is behind the `app` profile so the data-plane
+# infrastructure can be brought up and tested on machines without an NVIDIA
+# container runtime.
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: aeb-postgres
+    environment:
+      POSTGRES_USER: ${AEB_DB_USER:-ae_brain}
+      POSTGRES_PASSWORD: ${AEB_DB_PASSWORD:-ae_brain}
+      POSTGRES_DB: ${AEB_DB_NAME:-ae_brain}
+    ports:
+      - "${AEB_DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Schema is auto-applied on first init of an empty data dir.
+      - ./ae_brain/data/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AEB_DB_USER:-ae_brain} -d ${AEB_DB_NAME:-ae_brain}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: aeb-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${AEB_AMQP_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${AEB_AMQP_PASS:-guest}
+    ports:
+      - "${AEB_AMQP_PORT:-5672}:5672"      # AMQP
+      - "${AEB_AMQP_UI_PORT:-15672}:15672" # management UI
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  ae-brain:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ae-brain:latest
+    container_name: aeb-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      AEB_ENV: ${AEB_ENV:-dev}
+      AEB_LOG_JSON: "true"
+      # --- service discovery inside the compose network ---
+      AEB_DB_HOST: postgres
+      AEB_DB_PORT: "5432"
+      AEB_DB_USER: ${AEB_DB_USER:-ae_brain}
+      AEB_DB_PASSWORD: ${AEB_DB_PASSWORD:-ae_brain}
+      AEB_DB_NAME: ${AEB_DB_NAME:-ae_brain}
+      AEB_AMQP_URL: amqp://${AEB_AMQP_USER:-guest}:${AEB_AMQP_PASS:-guest}@rabbitmq:5672/
+      AEB_AMQP_HOST: rabbitmq   # used by entrypoint wait-for
+      AEB_AMQP_PORT: "5672"
+      # --- GPU / precision (4x P100) ---
+      AEB_GPU_ENABLED: "true"
+      AEB_GPU_USE_FP16: "true"
+      AEB_GPU_PREFER_ONNX: "true"
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # entrypoint behaviour
+      AEB_WAIT_FOR_DEPS: "true"
+      AEB_AUTO_INIT_DB: "true"
+    volumes:
+      - ./artifacts:/app/artifacts
+      - ./data:/app/data
+    # Default command consumes data.candidates.ai and publishes signal.final.
+    command: ["run"]
+    # GPU reservation. Requires the NVIDIA Container Toolkit on the host.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  rabbitmqdata:

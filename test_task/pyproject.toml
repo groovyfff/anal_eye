@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ae-brain"
+version = "0.1.0"
+description = "A.E. Brain - Autonomous 4-layer predictive trading ensemble for Binance"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "A.E. Brain Team" }]
+
+# Runtime dependencies are pinned in requirements.txt (kept authoritative there
+# because TA-Lib + CUDA torch wheels require manual index selection).
+dependencies = [
+    "numpy<2.0,>=1.26.4",
+    "pandas>=2.1,<2.3",
+    "scipy>=1.11,<1.14",
+    "scikit-learn>=1.3,<1.6",
+    "pydantic>=2.5,<3.0",
+    "pydantic-settings>=2.1,<3.0",
+    "typer>=0.12,<0.13",
+    # typer <0.13 breaks with click >=8.2 (secondary-flag error on bool options).
+    "click>=8.0,<8.2",
+    "structlog>=24.1,<25.0",
+    "orjson>=3.9,<4.0",
+    "joblib>=1.3,<2.0",
+]
+
+[project.optional-dependencies]
+ml = [
+    "lightgbm>=4.3,<5.0",
+    "xgboost>=2.0,<3.0",
+    "catboost>=1.2,<2.0",
+    "torch>=2.1,<2.4",
+    "onnx>=1.15,<2.0",
+    "onnxruntime-gpu>=1.17,<2.0",
+    "gymnasium>=0.29,<1.1",
+    "stable-baselines3>=2.2,<3.0",
+]
+infra = [
+    "asyncpg>=0.29,<0.30",
+    "SQLAlchemy[asyncio]>=2.0,<2.1",
+    "aio-pika>=9.4,<10.0",
+    "chromadb>=0.4.24,<0.6",
+    "fastapi>=0.110,<0.116",
+    "uvicorn>=0.27,<0.31",
+]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "ruff>=0.4"]
+
+[project.scripts]
+ae-brain = "ae_brain.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ae_brain*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

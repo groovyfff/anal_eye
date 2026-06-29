@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Model artifacts & data (regenerate via the CLI)
+artifacts/
+data/
+*.joblib
+*.pt
+*.onnx
+*.zip
+*.npz
+
+# Local config / secrets
+.env
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+#Logs
+*.log
+
+#OS Trash
+.DS_Store
+Thumbs.db

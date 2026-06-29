@@ -1,0 +1,28 @@
+# Keep the build context small and reproducible.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+.git/
+.gitignore
+.github/
+
+# Local artifacts/data are mounted as volumes, not baked into the image.
+artifacts/
+data/
+*.joblib
+*.pt
+*.onnx
+*.npz
+
+.env
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.md
+!README.md
