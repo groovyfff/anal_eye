@@ -1,0 +1,128 @@
+rabbitmq:
+  url: "amqp://user:password@localhost:5672/"
+  exchange: "analeyes_exchange"
+  candidate_queue: "data.candidates.ai"
+  live_prices_queue: "data.live_prices.external"
+  connect_retries: 10
+  connect_retry_delay_s: 2
+
+data_provider:
+  name: "yahoo_finance"
+  api_key: ""
+  request_delay_s: 0.25
+  max_retries: 5
+
+watchlist:
+  stocks:
+    - symbol: "AAPL"
+      name: "Apple Inc."
+      exchange: "NASDAQ"
+    - symbol: "MSFT"
+      name: "Microsoft Corporation"
+      exchange: "NASDAQ"
+    - symbol: "NVDA"
+      name: "NVIDIA Corporation"
+      exchange: "NASDAQ"
+    - symbol: "TSLA"
+      name: "Tesla, Inc."
+      exchange: "NASDAQ"
+    - symbol: "GOOGL"
+      name: "Alphabet Inc."
+      exchange: "NASDAQ"
+    - symbol: "AMZN"
+      name: "Amazon.com, Inc."
+      exchange: "NASDAQ"
+    - symbol: "META"
+      name: "Meta Platforms, Inc."
+      exchange: "NASDAQ"
+  metals:
+    - symbol: "GC=F"
+      name: "Gold Futures"
+    - symbol: "SI=F"
+      name: "Silver Futures"
+  forex:
+    - symbol: "EURUSD=X"
+      name: "EUR/USD"
+    - symbol: "GBPUSD=X"
+      name: "GBP/USD"
+    - symbol: "USDJPY=X"
+      name: "USD/JPY"
+  indices:
+    - symbol: "SPY"
+      name: "SPDR S&P 500 ETF"
+      use_for_correlation: true
+    - symbol: "^GSPC"
+      name: "S&P 500"
+      use_for_correlation: true
+    - symbol: "^NDX"
+      name: "NASDAQ 100"
+      use_for_correlation: false
+    - symbol: "DX-Y.NYB"
+      name: "US Dollar Index"
+      use_for_correlation: true
+
+main_timeframe: "5m"
+context_timeframes:
+  - "1h"
+  - "4h"
+history_depth: 200
+
+scan_interval_s: 60
+scan_workers: 4
+price_broadcast_interval_s: 5
+use_thread_pool: true
+
+market_hours:
+  timezone: "America/New_York"
+  stock_open: "09:30"
+  stock_close: "16:00"
+  use_fixed_utc_window: true
+  stock_open_utc: "14:30"
+  stock_close_utc: "21:00"
+  pre_market_enabled: false
+  after_hours_enabled: false
+  # Optional same-day UTC ranges where metals must be considered closed.
+  # Example:
+  # - "12:00-12:15"
+  # - "17:30-18:00"
+  metal_breaks_utc: []
+
+triggers:
+  ema_crossover:
+    enabled: true
+    fast_period: 8
+    slow_period: 21
+  rsi_extreme:
+    enabled: true
+    oversold_exit: 30
+    overbought_exit: 70
+  volume_spike:
+    enabled: true
+    threshold: 2.0
+    window: 20
+  macd_signal_cross:
+    enabled: true
+  price_breakout:
+    enabled: true
+    lookback_periods: 20
+
+composite_score:
+  min_publish_score: 0.5
+  weights:
+    vol_rel: 0.30
+    rsi_score: 0.20
+    macd_hist_score: 0.20
+    adx_score: 0.15
+    pattern_score: 0.15
+
+patterns:
+  enabled: true
+  lookback_candles: 8
+  max_detected: 6
+  min_strength: 0.35
+
+logging:
+  service_name: "external-markets-service"
+  level: "INFO"
+  json: false
+  format: "[%(service_name)s][%(symbol)s] %(asctime)s - %(name)s - %(levelname)s - %(message)s"

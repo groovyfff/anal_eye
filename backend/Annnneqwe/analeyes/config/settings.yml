@@ -1,0 +1,42 @@
+market_hours:
+  timezone: "America/New_York"
+  stock_open: "09:30"
+  stock_close: "16:00"
+  use_fixed_utc_window: true
+  stock_open_utc: "14:30"
+  stock_close_utc: "21:00"
+  pre_market_enabled: false
+  after_hours_enabled: false
+  metal_breaks_utc: []
+  forex_open_utc: "00:00"
+  forex_close_utc: "23:59"
+  crypto_always_open: true
+
+telegram:
+  group_id: null
+  min_confidence: 0.7
+  retry_attempts: 3
+  signal_cooldown_minutes: 15
+  asset_class_topics:
+    crypto: 1
+    stock: 20
+    metal: 21
+    forex: 22
+  ai_specific_topics:
+    gpt: 4
+    gemini: 2
+    claude: 12
+    deepseek: 6
+    qwen: 10
+    grok: 8
+    ensemble: 15
+
+signal_tracker:
+  enabled: true
+  expiration_hours: 24
+  entry_timeout_sec: 300
+  check_interval_s: 10
+  slippage_pct: 0.001
+  max_age_ms: 5000
+  prefer: tp
+  send_outcome_alerts: true

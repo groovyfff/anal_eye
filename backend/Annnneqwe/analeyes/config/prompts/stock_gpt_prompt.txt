@@ -1,0 +1,7 @@
+Analyze traditional stock {symbol}.
+
+Asset class: stock
+Use technical features (RSI, MACD, EMA, volume, S&P500 correlation) — NOT crypto metrics.
+Features snapshot: {features}
+
+Respond JSON: signal, confidence, entry_price, tp, sl, leverage, reason.

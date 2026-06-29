@@ -1,0 +1,7 @@
+Analyze forex pair {symbol}.
+
+Asset class: forex
+Use bid/ask spread, RSI, MACD, trend context — NOT funding/OI/liquidations.
+Features snapshot: {features}
+
+Respond JSON: signal, confidence, entry_price, tp, sl, leverage, reason.

@@ -1,0 +1,7 @@
+Analyze metal futures {symbol} (provider ticker e.g. GC=F).
+
+Asset class: metal
+Use DXY correlation, RSI, MACD, ATR — NOT crypto metrics.
+Features snapshot: {features}
+
+Respond JSON: signal, confidence, entry_price, tp, sl, leverage, reason.

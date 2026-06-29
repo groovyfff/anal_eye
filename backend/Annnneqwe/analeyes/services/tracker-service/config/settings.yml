@@ -1,0 +1,43 @@
+logging:
+  level: INFO
+  service_name: tracker-service
+
+rabbitmq:
+  url: "amqp://user:password@localhost:5672/"
+  exchange: "analeyes_exchange"
+  live_prices_queue: "data.live_prices.external"
+  signal_final_queue: "q_new_signals_for_tracker"
+  connect_retries: 10
+  connect_retry_delay_s: 2
+
+database:
+  enabled: true
+  pool_size: 5
+  max_overflow: 10
+
+market_hours:
+  timezone: "America/New_York"
+  stock_open: "09:30"
+  stock_close: "16:00"
+  use_fixed_utc_window: true
+  stock_open_utc: "14:30"
+  stock_close_utc: "21:00"
+  pre_market_enabled: false
+  after_hours_enabled: false
+  metal_breaks_utc: []
+
+signal_tracker:
+  enabled: true
+  expiration_hours: 24
+  entry_timeout_sec: 300
+  slippage_pct: 0.001
+  max_age_ms: 4500
+  prefer: tp
+  check_interval_s: 1
+
+trading:
+  default_initial_bank_usd: 500
+
+prometheus:
+  enabled: true
+  port: 8000

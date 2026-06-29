@@ -1,0 +1,141 @@
+version: '3.8'
+
+networks:
+  analeyes-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    networks:
+      - analeyes-net
+    ports:
+      - '5672:5672'
+      - '15672:15672'
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-user}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-password}
+    healthcheck:
+      test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  postgres:
+    image: postgres:15-alpine
+    networks:
+      - analeyes-net
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-analeyes}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-analeyes}
+      POSTGRES_DB: ${POSTGRES_DB:-analeyes}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-analeyes} -d ${POSTGRES_DB:-analeyes}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  external-markets-service:
+    build:
+      context: .
+      dockerfile: services/external-markets-service/Dockerfile
+    networks:
+      - analeyes-net
+    env_file:
+      - .env.example
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config
+      - ./shared:/app/shared
+      - ./services/external-markets-service/src:/app/src
+
+  tracker-service:
+    build:
+      context: .
+      dockerfile: services/tracker-service/Dockerfile
+    networks:
+      - analeyes-net
+    env_file:
+      - .env.example
+    environment:
+      PYTHONPATH: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config
+      - ./shared:/app/shared
+
+  ai-service:
+    build:
+      context: .
+      dockerfile: services/ai-service/Dockerfile
+    networks:
+      - analeyes-net
+    env_file:
+      - .env.example
+    environment:
+      PYTHONPATH: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config
+      - ./shared:/app/shared
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: services/notification-service/Dockerfile
+    networks:
+      - analeyes-net
+    env_file:
+      - .env.example
+    environment:
+      PYTHONPATH: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config
+      - ./shared:/app/shared
+
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    networks:
+      - analeyes-net
+    env_file:
+      - .env.example
+    environment:
+      PYTHONPATH: /app
+    ports:
+      - '8000:8000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    volumes:
+      - ./config:/app/config
+      - ./shared:/app/shared
