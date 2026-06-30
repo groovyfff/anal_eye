@@ -111,16 +111,28 @@ class TradeCandidate:
         # producer) or ``historical_ohlcv`` (external-markets backend producer).
         raw_candles = payload.get("candles")
         if raw_candles is None:
-            raw_candles = payload.get("historical_ohlcv", [])
+            for key in ("ohlcv", "klines", "kline_data", "historical_data", "price_history", "historical_ohlcv"):
+                if payload.get(key):
+                    raw_candles = payload[key]
+                    break
+        if raw_candles is None:
+            raw_candles = []
+        meta = dict(payload.get("meta", {}))
+        if payload.get("features"):
+            meta.setdefault("features", dict(payload["features"]))
+        if payload.get("composite_score") is not None:
+            meta.setdefault("composite_score", payload["composite_score"])
+        if payload.get("current_price") is not None:
+            meta.setdefault("current_price", payload["current_price"])
         return cls(
             symbol=str(payload["symbol"]),
-            interval=str(payload.get("interval", "5m")),
+            interval=str(payload.get("interval", payload.get("timeframe", "5m"))),
             candles=cls._normalize_candles(list(raw_candles)),
             signal_log_db_id=signal_log_db_id,
             asset_class=str(payload.get("asset_class", AssetClass.CRYPTO.value)),
             signal_id=str(payload.get("signal_id", "")),
             correlation_id=str(payload.get("correlation_id", "")),
-            meta=dict(payload.get("meta", {})),
+            meta=meta,
         )
 
 
@@ -178,7 +190,7 @@ class FinalSignal:
     signal_id: str = ""
     asset_class: str = ""
     signal_log_db_id: int = 0
-    source_ai: str = "ensemble"
+    source_ai: str = "ae_brain"
     ev: dict[str, Any] = field(default_factory=dict)
     components: dict[str, Any] = field(default_factory=dict)
     ts: float = field(default_factory=time.time)
@@ -194,6 +206,14 @@ class FinalSignal:
         d["tp"] = self.take_profit
         d["sl"] = self.stop_loss
         d["entry_price"] = self.entry_reference
+        d["signal_type"] = self.decision.value
+        d["reason_summary"] = (
+            f"AE Brain {self.components.get('decision_source', 'fusion')}: "
+            f"{self.decision.value} (confidence={self.confidence:.3f})"
+        )
+        d["tp_price"] = self.take_profit
+        d["sl_price"] = self.stop_loss
+        d["consensus_achieved"] = self.decision.value in ("LONG", "SHORT")
         d["signal_time"] = (
             datetime.fromtimestamp(self.ts, tz=timezone.utc)
             .isoformat()

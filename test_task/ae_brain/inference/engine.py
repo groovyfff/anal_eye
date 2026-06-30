@@ -139,6 +139,7 @@ class InferenceEngine:
         self._process_pool: Optional[ProcessPoolExecutor] = None
         if settings.executor.process_workers > 0:
             self._process_pool = ProcessPoolExecutor(max_workers=settings.executor.process_workers)
+        self._models_loaded = False
 
     # ------------------------------------------------------------------ #
     def load_models(self) -> None:
@@ -158,6 +159,11 @@ class InferenceEngine:
             regime=bool(regime is not None and getattr(regime, "is_ready", lambda: False)()),
             meta=bool(self._meta is not None and self._meta.is_ready()),
         )
+        self._models_loaded = True
+
+    def is_ready(self) -> bool:
+        """True after :meth:`load_models` has been invoked (inference may use fallbacks)."""
+        return self._models_loaded
 
     async def shutdown(self) -> None:
         self._thread_pool.shutdown(wait=True)

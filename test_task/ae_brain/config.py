@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -41,22 +41,98 @@ class DatabaseConfig(BaseSettings):
         return self.dsn
 
 
-class RabbitMQConfig(BaseSettings):
-    """RabbitMQ broker settings.
+class AmqpInputConfig(BaseSettings):
+    """RabbitMQ consumer settings for ``data.candidates.ai``."""
 
-    The ensemble *consumes* trade candidates from ``data.candidates.ai`` and
-    *publishes* finalized signals to ``signal.final``.
-    """
+    model_config = SettingsConfigDict(env_prefix="AEB_INPUT_", extra="ignore")
+
+    amqp_url: str = ""
+    exchange: str = "analeyes.events"
+    queue: str = "q_data_candidates_ai"
+    routing_key: str = "data.candidates.ai"
+    prefetch_count: int = 16
+    consumer_tag: str = "ae-brain-q_data_candidates_ai"
+    requeue_on_error: bool = True
+
+    @property
+    def resolved_url(self) -> str:
+        return resolve_amqp_url(self.amqp_url)
+
+
+class AmqpOutputConfig(BaseSettings):
+    """RabbitMQ publisher settings for ``signal.final``."""
+
+    model_config = SettingsConfigDict(env_prefix="AEB_OUTPUT_", extra="ignore")
+
+    amqp_url: str = ""
+    exchange: str = "analeyes.events"
+    routing_key: str = "signal.final"
+
+    @property
+    def resolved_url(self) -> str:
+        return resolve_amqp_url(self.amqp_url)
+
+
+class LegacyAmqpConfig(BaseSettings):
+    """Deprecated single-broker settings kept for backward compatibility."""
 
     model_config = SettingsConfigDict(env_prefix="AEB_AMQP_", extra="ignore")
 
-    url: str = "amqp://guest:guest@localhost:5672/"
-    consume_queue: str = "data.candidates.ai"
-    publish_exchange: str = ""  # default exchange => routing_key == queue name
+    url: str = ""
+    host: str = "host.docker.internal"
+    port: int = 5672
+
+
+class TelegramDebugConfig(BaseSettings):
+    model_config = SettingsConfigDict(extra="ignore")
+
+    enabled: bool = Field(default=False, validation_alias="AEB_DIRECT_TELEGRAM_ENABLED")
+    bot_token: str = Field(default="", validation_alias="TELEGRAM_BOT_TOKEN")
+    group_id: str = Field(default="", validation_alias="TELEGRAM_GROUP_ID")
+    topic_id: str | None = Field(default=None, validation_alias="TELEGRAM_TOPIC_ID")
+
+
+def resolve_amqp_url(
+    explicit_url: str,
+    *,
+    legacy_url: str = "",
+    host: str = "host.docker.internal",
+) -> str:
+    """Resolve AMQP URL with analeyes vhost defaults (never guest/%2F)."""
+    import os
+
+    if explicit_url:
+        return explicit_url
+    if legacy_url:
+        return legacy_url
+    password = (
+        os.getenv("RABBITMQ_APP_PASSWORD")
+        or os.getenv("RABBITMQ_PASSWORD")
+        or os.getenv("RABBITMQ_PASS")
+        or os.getenv("AEB_RABBITMQ_APP_PASSWORD")
+        or "analeyes_dev_secret"
+    )
+    return f"amqp://analeyes:{password}@{host}:5672/analeyes"
+
+
+# Backward-compatible alias used by older imports/tests.
+class RabbitMQConfig(AmqpInputConfig):
+    """Deprecated alias; prefer :class:`AmqpInputConfig`."""
+
+    consume_queue: str = "q_data_candidates_ai"
+    publish_exchange: str = "analeyes.events"
     publish_routing_key: str = "signal.final"
-    prefetch_count: int = 16
-    consumer_tag: str = "ae-brain-fusion"
-    requeue_on_error: bool = False  # dead-letter instead of infinite redelivery
+
+    def __init__(self, **data: object) -> None:
+        if "consume_queue" in data and "queue" not in data:
+            data["queue"] = data.pop("consume_queue")
+        if "publish_exchange" in data and "exchange" not in data:
+            data["exchange"] = data.pop("publish_exchange")
+        if "publish_routing_key" in data and "routing_key" not in data:
+            data["routing_key"] = data.pop("publish_routing_key")
+        if "url" in data and "amqp_url" not in data:
+            data["amqp_url"] = data.pop("url")
+        super().__init__(**data)
 
 
 class GPUConfig(BaseSettings):
@@ -169,9 +245,14 @@ class Settings(BaseSettings):
     env: Literal["dev", "staging", "prod"] = "dev"
     log_level: str = "INFO"
     log_json: bool = False
+    allow_legacy_guest_vhost: bool = Field(default=False, validation_alias="AEB_ALLOW_LEGACY_GUEST_VHOST")
+    min_composite_score: float = Field(default=0.0, validation_alias="AEB_MIN_COMPOSITE_SCORE")
 
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
-    rabbitmq: RabbitMQConfig = Field(default_factory=RabbitMQConfig)
+    amqp_input: AmqpInputConfig = Field(default_factory=AmqpInputConfig)
+    amqp_output: AmqpOutputConfig = Field(default_factory=AmqpOutputConfig)
+    amqp_legacy: LegacyAmqpConfig = Field(default_factory=LegacyAmqpConfig)
+    telegram_debug: TelegramDebugConfig = Field(default_factory=TelegramDebugConfig)
     gpu: GPUConfig = Field(default_factory=GPUConfig)
     executor: ExecutorConfig = Field(default_factory=ExecutorConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
@@ -180,6 +261,18 @@ class Settings(BaseSettings):
     fusion: FusionConfig = Field(default_factory=FusionConfig)
 
     enable_chromadb_rag: bool = False
+
+    @model_validator(mode="after")
+    def _resolve_amqp_urls(self) -> "Settings":
+        host = self.amqp_legacy.host
+        legacy_url = self.amqp_legacy.url
+        input_url = self.amqp_input.amqp_url or resolve_amqp_url("", legacy_url=legacy_url, host=host)
+        output_url = self.amqp_output.amqp_url or input_url
+        if input_url != self.amqp_input.amqp_url:
+            self.amqp_input = self.amqp_input.model_copy(update={"amqp_url": input_url})
+        if output_url != self.amqp_output.amqp_url:
+            self.amqp_output = self.amqp_output.model_copy(update={"amqp_url": output_url})
+        return self
 
 
 @lru_cache(maxsize=1)

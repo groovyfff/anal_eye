@@ -1,11 +1,4 @@
-"""Live runtime wiring: DB + broker + inference engine.
-
-Glues the async pieces together for the production loop:
-
-    data.candidates.ai  -->  InferenceEngine.evaluate  -->  signal.final
-                                     |
-                                     +--> signal_feature_logs (PostgreSQL)
-"""
+"""Live runtime wiring: DB + broker + inference engine."""
 
 from __future__ import annotations
 
@@ -27,19 +20,26 @@ class LiveRuntime:
         self._s = settings or get_settings()
         self._db = Database(self._s.database)
         self._engine = InferenceEngine(self._s, db=self._db)
-        self._broker = SignalBroker(self._s.rabbitmq)
+        self._broker = SignalBroker(
+            self._s.amqp_input,
+            self._s.amqp_output,
+            allow_legacy_guest_vhost=self._s.allow_legacy_guest_vhost,
+            min_composite_score=self._s.min_composite_score,
+            models_loaded=self._engine.is_ready,
+            telegram_cfg=self._s.telegram_debug,
+        )
         self._stopping = asyncio.Event()
 
     async def _handle(self, candidate: TradeCandidate) -> FinalSignal | None:
-        signal = await self._engine.evaluate(candidate)
-        # Always publish (including SKIP) so downstream has a full audit trail.
-        return signal
+        return await self._engine.evaluate(candidate)
 
     async def start(self) -> None:
         configure_logging(self._s.log_level, self._s.log_json)
         log.info("runtime.starting", env=self._s.env)
         await self._db.connect()
         self._engine.load_models()
+        if not self._engine.is_ready():
+            log.warning("runtime.models_not_ready", msg="inference may SKIP with model_not_loaded")
         await self._broker.connect()
 
         consume_task = asyncio.create_task(self._broker.consume(self._handle))
@@ -63,7 +63,6 @@ class LiveRuntime:
         await self._engine.shutdown()
         await self._db.close()
 
-    # Convenience for one-shot evaluation (CLI / API / tests).
     async def evaluate_once(self, candidate: TradeCandidate, use_db: bool = False) -> FinalSignal:
         if use_db:
             await self._db.connect()
