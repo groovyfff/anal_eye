@@ -11,7 +11,10 @@ from typing import Any, Callable, TypeVar
 from shared.database.db_manager import DatabaseManager
 from shared.database.signal_log_repository import save_external_candidate_log
 from shared.market_hours import MarketHours
+from shared.rabbitmq_config import resolve_rabbitmq_url
 from shared.utils.data_encoder import dumps_payload
+from shared.utils.pika_client import PikaClient
+from shared.utils.rabbitmq_topology import EXCHANGE, RoutingKey
 
 from src.collectors.base_collector import BaseCollector, Quote
 from src.collectors.polygon_collector import PolygonCollector
@@ -23,7 +26,6 @@ from src.logic.payload_validator import validate_candidate_payload, validate_liv
 from src.logic.trigger_engine import TriggerEngine, TriggerResult
 from src.settings import get_watchlist_items, load_settings
 from src.utils.logger import get_logger, setup_logging
-from src.utils.pika_client import PikaClient
 
 _T = TypeVar('_T')
 
@@ -35,9 +37,9 @@ class ExternalMarketsService:
         self.settings = settings
         setup_logging(settings.get('logging', {}))
         self.logger = get_logger(__name__)
-        self.exchange_name = settings.get('rabbitmq', {}).get('exchange', 'analeyes_exchange')
-        self.candidate_routing_key = 'data.candidates.ai'
-        self.price_routing_key = 'data.live_prices.external'
+        self.exchange_name = settings.get('rabbitmq', {}).get('exchange', EXCHANGE)
+        self.candidate_routing_key = RoutingKey.DATA_CANDIDATES_AI
+        self.price_routing_key = RoutingKey.DATA_LIVE_PRICES_EXTERNAL
         self.main_timeframe = settings.get('main_timeframe', '5m')
         self.context_timeframes = settings.get('context_timeframes', ['1h', '4h'])
         self.history_depth = self._clamp_int_setting(
@@ -96,15 +98,9 @@ class ExternalMarketsService:
         rabbit_cfg = settings.get('rabbitmq', {})
         self.rabbit_connect_retries = int(rabbit_cfg.get('connect_retries', 10))
         self.rabbit_connect_retry_delay_s = float(rabbit_cfg.get('connect_retry_delay_s', 2.0))
-        candidate_queue_name = str(rabbit_cfg.get('candidate_queue', self.candidate_routing_key))
-        live_queue_name = str(rabbit_cfg.get('live_prices_queue', self.price_routing_key))
         self.rabbit = PikaClient(
-            url=rabbit_cfg.get('url', os.environ.get('RABBITMQ_URL', 'amqp://guest:guest@localhost:5672/')),
+            url=rabbit_cfg.get('url') or resolve_rabbitmq_url(),
             default_exchange=self.exchange_name,
-            queue_bindings=[
-                (candidate_queue_name, self.candidate_routing_key),
-                (live_queue_name, self.price_routing_key),
-            ],
         )
         self._quote_cache: dict[str, Quote] = {}
         self._last_published_candidate_timestamps: dict[str, str] = {}

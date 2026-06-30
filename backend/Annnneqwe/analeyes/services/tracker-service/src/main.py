@@ -15,7 +15,9 @@ import yaml
 from dotenv import load_dotenv
 from shared.database.db_manager import DatabaseManager
 from shared.market_hours import MarketHours
+from shared.rabbitmq_config import inject_rabbitmq_url, resolve_rabbitmq_url
 from shared.utils.data_encoder import dumps_payload
+from shared.utils.rabbitmq_topology import EXCHANGE, Queue, RoutingKey, declare_exchange, bind_queue
 
 from src.logic.external_prices import ExternalPriceStore
 from src.logic.signal_tracker import SignalTracker, TrackedSignal
@@ -91,7 +93,7 @@ class RabbitPublisher:
         params = pika.URLParameters(self.url)
         self._connection = pika.BlockingConnection(parameters=params)
         self._channel = self._connection.channel()
-        self._channel.exchange_declare(exchange=self.default_exchange, exchange_type='topic', durable=True)
+        declare_exchange(self._channel, self.default_exchange)
 
     def _ensure_connected(self) -> None:
         if self._connection and self._connection.is_open and self._channel is not None:
@@ -150,7 +152,7 @@ class RabbitConsumer:
         params = pika.URLParameters(self.url)
         connection = pika.BlockingConnection(parameters=params)
         channel = connection.channel()
-        channel.exchange_declare(exchange=self.exchange, exchange_type='topic', durable=True)
+        declare_exchange(channel, self.exchange)
 
         def _callback(ch: Any, method: Any, _properties: Any, body: bytes) -> None:
             try:
@@ -165,7 +167,7 @@ class RabbitConsumer:
 
         for queue_name, routing_key in self.bindings:
             channel.queue_declare(queue=queue_name, durable=True)
-            channel.queue_bind(exchange=self.exchange, queue=queue_name, routing_key=routing_key)
+            bind_queue(channel, queue_name, routing_key, self.exchange)
             channel.basic_consume(queue=queue_name, on_message_callback=_callback, auto_ack=False)
 
         while not self._stop_event.is_set() and connection.is_open:
@@ -178,9 +180,10 @@ def load_settings(path: str | Path) -> dict[str, Any]:
     load_dotenv()
     settings_path = Path(path)
     payload = yaml.safe_load(settings_path.read_text(encoding='utf-8')) or {}
-    rabbitmq_url = os.getenv('RABBITMQ_URL')
-    if rabbitmq_url:
-        payload.setdefault('rabbitmq', {})['url'] = rabbitmq_url
+    try:
+        inject_rabbitmq_url(payload)
+    except ValueError:
+        pass
     return payload
 
 
@@ -190,7 +193,7 @@ class SignalServiceApp:
     def __init__(self, settings: dict[str, Any]) -> None:
         self.settings = settings
         setup_logging(settings.get('logging', {}))
-        self.exchange_name = str(settings.get('rabbitmq', {}).get('exchange', 'analeyes_exchange'))
+        self.exchange_name = str(settings.get('rabbitmq', {}).get('exchange', EXCHANGE))
         tracker_cfg = settings.get('signal_tracker', {}) or {}
         self.check_interval_s = float(tracker_cfg.get('check_interval_s', 1))
         self.db_enabled = bool(settings.get('database', {}).get('enabled', True))
@@ -213,13 +216,13 @@ class SignalServiceApp:
             on_duplicate=self._on_duplicate_signal,
         )
         rabbit_cfg = settings.get('rabbitmq', {}) or {}
-        self.live_prices_routing_key = 'data.live_prices.external'
-        self.signal_final_routing_key = 'signal.final'
-        self.outcome_routing_key = 'signal.outcome'
-        self.entry_event_routing_key = 'signal.entry_event'
-        self.live_prices_queue = str(rabbit_cfg.get('live_prices_queue', self.live_prices_routing_key))
-        self.signal_final_queue = str(rabbit_cfg.get('signal_final_queue', 'q_new_signals_for_tracker'))
-        self.rabbit_url = rabbit_cfg.get('url', os.environ.get('RABBITMQ_URL', 'amqp://user:password@rabbitmq:5672/'))
+        self.live_prices_routing_key = RoutingKey.DATA_LIVE_PRICES_EXTERNAL
+        self.signal_final_routing_key = RoutingKey.SIGNAL_FINAL
+        self.outcome_routing_key = RoutingKey.SIGNAL_OUTCOME
+        self.entry_event_routing_key = RoutingKey.SIGNAL_ENTRY_EVENT
+        self.live_prices_queue = str(rabbit_cfg.get('live_prices_queue', Queue.LIVE_PRICES_EXTERNAL))
+        self.signal_final_queue = str(rabbit_cfg.get('signal_final_queue', Queue.TRACKER_SIGNALS))
+        self.rabbit_url = rabbit_cfg.get('url') or resolve_rabbitmq_url()
         self.rabbit_connect_retries = int(rabbit_cfg.get('connect_retries', 10))
         self.rabbit_connect_retry_delay_s = float(rabbit_cfg.get('connect_retry_delay_s', 2.0))
         self.publisher = RabbitPublisher(url=self.rabbit_url, default_exchange=self.exchange_name)

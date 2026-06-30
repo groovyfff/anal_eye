@@ -1,8 +1,7 @@
 rabbitmq:
-  url: "amqp://user:password@localhost:5672/"
-  exchange: "analeyes_exchange"
-  candidate_queue: "data.candidates.ai"
-  live_prices_queue: "data.live_prices.external"
+  # Resolved at runtime from RABBITMQ_URL / RABBITMQ_* env (shared.rabbitmq_config).
+  url: ""
+  exchange: "analeyes.events"
   connect_retries: 10
   connect_retry_delay_s: 2
 

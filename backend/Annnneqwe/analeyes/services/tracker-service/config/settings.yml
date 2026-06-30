@@ -3,10 +3,11 @@ logging:
   service_name: tracker-service
 
 rabbitmq:
-  url: "amqp://user:password@localhost:5672/"
-  exchange: "analeyes_exchange"
-  live_prices_queue: "data.live_prices.external"
-  signal_final_queue: "q_new_signals_for_tracker"
+  # Resolved at runtime from RABBITMQ_URL / RABBITMQ_* env (shared.rabbitmq_config).
+  url: ""
+  exchange: "analeyes.events"
+  live_prices_queue: "q_data_live_prices_external"
+  signal_final_queue: "q_tracker_signals"
   connect_retries: 10
   connect_retry_delay_s: 2
 

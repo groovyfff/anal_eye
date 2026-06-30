@@ -1,0 +1,2 @@
+# Local secrets — never commit (see setup-env.sh to create from .env.example).
+.env

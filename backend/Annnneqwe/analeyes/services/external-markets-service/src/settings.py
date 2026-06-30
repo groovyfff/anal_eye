@@ -5,13 +5,16 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from shared.rabbitmq_config import inject_rabbitmq_url
+
 def load_settings(path: str | Path) -> dict[str, Any]:
     load_dotenv()
     settings_path = Path(path)
     payload = yaml.safe_load(settings_path.read_text(encoding='utf-8')) or {}
-    rabbitmq_url = os.getenv('RABBITMQ_URL')
-    if rabbitmq_url:
-        payload.setdefault('rabbitmq', {})['url'] = rabbitmq_url
+    try:
+        inject_rabbitmq_url(payload)
+    except ValueError:
+        pass
     api_key = os.getenv('DATA_PROVIDER_API_KEY')
     if api_key:
         payload.setdefault('data_provider', {})['api_key'] = api_key

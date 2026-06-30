@@ -16,6 +16,8 @@ import pika
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from shared.rabbitmq_config import resolve_rabbitmq_url
+from shared.utils.rabbitmq_topology import EXCHANGE
 from src.settings import load_settings
 from src.utils.logger import setup_logging
 
@@ -26,18 +28,13 @@ st.set_page_config(
     layout="wide",
 )
 
-# Load settings for RabbitMQ
+# Load settings for RabbitMQ (url injected from env at runtime).
 settings = load_settings("config/settings.yml")
 rabbit_cfg = settings.get('rabbitmq', {})
 
-# Inside Docker, we should use 'rabbitmq' hostname if defined, else fallback to settings
-RABBIT_URL = os.environ.get('RABBITMQ_URL') or rabbit_cfg.get('url', 'amqp://guest:guest@localhost:5672/')
+RABBIT_URL = rabbit_cfg.get('url') or resolve_rabbitmq_url()
 
-# Fix for docker networking: if localhost is in the URL and we're in docker, swap it
-if 'localhost' in RABBIT_URL and os.path.exists('/.dockerenv'):
-    RABBIT_URL = RABBIT_URL.replace('localhost', 'rabbitmq')
-
-EXCHANGE = rabbit_cfg.get('exchange', 'analeyes_exchange')
+EXCHANGE = rabbit_cfg.get('exchange', EXCHANGE)
 
 # --- State Management ---
 if 'live_prices' not in st.session_state:

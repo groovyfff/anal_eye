@@ -6,24 +6,49 @@ networks:
 
 volumes:
   postgres_data:
+  rabbitmq_data:
 
 services:
   rabbitmq:
-    image: rabbitmq:3.12-management
+    image: rabbitmq:3.13-management
+    hostname: rabbitmq
     networks:
       - analeyes-net
     ports:
-      - '5672:5672'
-      - '15672:15672'
+      - '${RABBITMQ_PORT:-5672}:5672'
+      - '${RABBITMQ_MANAGEMENT_PORT:-15672}:15672'
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-user}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:-password}
+      # Management/admin user for UI + bootstrap API only — NOT used by application services.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_ADMIN_USER:-admin}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_ADMIN_PASSWORD:-changeme}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ['CMD', 'rabbitmq-diagnostics', '-q', 'ping']
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 20s
+
+  # Idempotent app user + vhost creation (works on fresh and existing broker volumes).
+  rabbitmq-bootstrap:
+    image: curlimages/curl:8.7.1
+    networks:
+      - analeyes-net
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_ADMIN_USER: ${RABBITMQ_ADMIN_USER:-admin}
+      RABBITMQ_ADMIN_PASSWORD: ${RABBITMQ_ADMIN_PASSWORD:-changeme}
+      RABBITMQ_APP_USER: ${RABBITMQ_USER:-analeyes}
+      RABBITMQ_APP_PASSWORD: ${RABBITMQ_PASSWORD:-analeyes_dev_secret}
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-analeyes}
+    volumes:
+      - ./infra/rabbitmq/bootstrap.sh:/bootstrap.sh:ro
+    entrypoint: ['/bin/sh', '/bootstrap.sh']
+    restart: 'no'
 
   postgres:
     image: postgres:15-alpine
@@ -44,6 +69,42 @@ services:
       retries: 10
       start_period: 10s
 
+  binance-candidate-service:
+    build:
+      context: .
+      dockerfile: services/binance-candidate-service/Dockerfile
+    networks:
+      - analeyes-net
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+      RABBITMQ_EXCHANGE: analeyes.events
+    depends_on:
+      rabbitmq-bootstrap:
+        condition: service_completed_successfully
+    volumes:
+      - ./shared:/app/shared
+      - ./services/binance-candidate-service/src:/app/src
+
+  binance-live-price-service:
+    build:
+      context: .
+      dockerfile: services/binance-live-price-service/Dockerfile
+    networks:
+      - analeyes-net
+    env_file:
+      - .env
+    environment:
+      PYTHONPATH: /app
+      RABBITMQ_EXCHANGE: analeyes.events
+    depends_on:
+      rabbitmq-bootstrap:
+        condition: service_completed_successfully
+    volumes:
+      - ./shared:/app/shared
+      - ./services/binance-live-price-service/src:/app/src
+
   external-markets-service:
     build:
       context: .
@@ -51,12 +112,12 @@ services:
     networks:
       - analeyes-net
     env_file:
-      - .env.example
+      - .env
     depends_on:
       postgres:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+      rabbitmq-bootstrap:
+        condition: service_completed_successfully
     volumes:
       - ./config:/app/config
       - ./shared:/app/shared
@@ -69,33 +130,38 @@ services:
     networks:
       - analeyes-net
     env_file:
-      - .env.example
+      - .env
     environment:
       PYTHONPATH: /app
+      RABBITMQ_EXCHANGE: analeyes.events
     depends_on:
       postgres:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+      rabbitmq-bootstrap:
+        condition: service_completed_successfully
     volumes:
       - ./config:/app/config
       - ./shared:/app/shared
 
   ai-service:
+    profiles: ["legacy-ai"]
     build:
       context: .
       dockerfile: services/ai-service/Dockerfile
     networks:
       - analeyes-net
     env_file:
-      - .env.example
+      - .env
     environment:
       PYTHONPATH: /app
+      RABBITMQ_EXCHANGE: analeyes.events
+      AI_ACCEPT_MANUAL_TEST_CANDIDATES: ${AI_ACCEPT_MANUAL_TEST_CANDIDATES:-false}
+      AI_SERVICE_CONSUME_CANDIDATES: ${AI_SERVICE_CONSUME_CANDIDATES:-false}
     depends_on:
       postgres:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+      rabbitmq-bootstrap:
+        condition: service_completed_successfully
     volumes:
       - ./config:/app/config
       - ./shared:/app/shared
@@ -107,14 +173,15 @@ services:
     networks:
       - analeyes-net
     env_file:
-      - .env.example
+      - .env
     environment:
       PYTHONPATH: /app
+      RABBITMQ_EXCHANGE: analeyes.events
     depends_on:
       postgres:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+      rabbitmq-bootstrap:
+        condition: service_completed_successfully
     volumes:
       - ./config:/app/config
       - ./shared:/app/shared
@@ -126,16 +193,17 @@ services:
     networks:
       - analeyes-net
     env_file:
-      - .env.example
+      - .env
     environment:
       PYTHONPATH: /app
+      RABBITMQ_EXCHANGE: analeyes.events
     ports:
       - '8000:8000'
     depends_on:
       postgres:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+      rabbitmq-bootstrap:
+        condition: service_completed_successfully
     volumes:
       - ./config:/app/config
       - ./shared:/app/shared

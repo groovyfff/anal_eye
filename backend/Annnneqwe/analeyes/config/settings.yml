@@ -13,15 +13,16 @@ market_hours:
   crypto_always_open: true
 
 telegram:
-  group_id: null
+  # Set TELEGRAM_GROUP_ID in .env (never commit real chat IDs in production repos).
+  group_id: -1004293390337
   min_confidence: 0.7
   retry_attempts: 3
   signal_cooldown_minutes: 15
   asset_class_topics:
-    crypto: 1
-    stock: 20
-    metal: 21
-    forex: 22
+    crypto: null 
+    stock: null
+    metal: null
+    forex: null
   ai_specific_topics:
     gpt: 4
     gemini: 2
@@ -30,6 +31,7 @@ telegram:
     qwen: 10
     grok: 8
     ensemble: 15
+    ae_brain: 15
 
 signal_tracker:
   enabled: true

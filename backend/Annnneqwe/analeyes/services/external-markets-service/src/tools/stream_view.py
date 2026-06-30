@@ -8,6 +8,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 import pika
+from shared.rabbitmq_config import resolve_rabbitmq_url
+from shared.utils.rabbitmq_topology import EXCHANGE
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 def _utc_now_ms() -> int:
     return int(time.time() * 1000)
@@ -58,8 +60,8 @@ def _print_candidate(payload: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description='Human-friendly live output for external-markets-service streams.')
     parser.add_argument('--stream', choices=['all', 'live', 'ai'], default='all', help='What stream to show (default: all).')
-    parser.add_argument('--rabbitmq-url', default=os.getenv('RABBITMQ_URL', 'amqp://user:password@rabbitmq:5672/'), help='AMQP URL (default from RABBITMQ_URL env).')
-    parser.add_argument('--exchange', default=os.getenv('RABBITMQ_EXCHANGE', 'analeyes_exchange'), help='Exchange name (default: analeyes_exchange).')
+    parser.add_argument('--rabbitmq-url', default=None, help='AMQP URL (default: RABBITMQ_URL or split RABBITMQ_* env).')
+    parser.add_argument('--exchange', default=os.getenv('RABBITMQ_EXCHANGE', EXCHANGE), help='Exchange name (default: analeyes.events).')
     args = parser.parse_args()
     routing_keys: list[str]
     if args.stream == 'live':
@@ -68,7 +70,8 @@ def main() -> int:
         routing_keys = ['data.candidates.ai']
     else:
         routing_keys = ['data.live_prices.external', 'data.candidates.ai']
-    params = pika.URLParameters(args.rabbitmq_url)
+    amqp_url = args.rabbitmq_url or resolve_rabbitmq_url()
+    params = pika.URLParameters(amqp_url)
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
     channel.exchange_declare(exchange=args.exchange, exchange_type='topic', durable=True)
