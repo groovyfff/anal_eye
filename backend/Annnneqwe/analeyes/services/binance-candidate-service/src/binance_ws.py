@@ -86,6 +86,8 @@ class BinanceCandidateStream:
         await self._maybe_publish(parsed.symbol, parsed.event_time, parsed.is_closed)
 
     async def _maybe_publish(self, symbol: str, event_time: int, candle_closed: bool) -> None:
+        if self._config.continuous_test_mode:
+            return
         count = self._buffer.count(symbol)
         min_candles = self._config.min_candles
         if count < min_candles:
@@ -101,13 +103,21 @@ class BinanceCandidateStream:
             return
 
         candles = self._buffer.candles(symbol)
-        payload = build_candidate_payload(
-            symbol=symbol,
-            market=self._config.market,
-            timeframe=self._config.timeframe,
-            event_time=event_time,
-            candles=candles,
-        )
+        try:
+            payload = build_candidate_payload(
+                symbol=symbol,
+                market=self._config.market,
+                timeframe=self._config.timeframe,
+                event_time=event_time,
+                candles=candles,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Skipping candidate publish symbol=%s reason=%s",
+                symbol,
+                exc,
+            )
+            return
         await self._publisher.publish_candidate(payload)
         self._policy.mark_published(symbol)
         logger.info(

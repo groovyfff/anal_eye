@@ -1,17 +1,31 @@
 # =============================================================================
 # A.E. Brain local infrastructure
 #
-#   docker compose up -d                # Postgres + AE Brain (main broker)
-#   docker compose --profile local-mq up -d  # optional local RabbitMQ only
+#   docker compose --profile app up -d --build
+#   docker compose --profile local-mq up -d   # optional local RabbitMQ only
 #
-# AE Brain connects to the MAIN AnalEyes RabbitMQ on vhost `analeyes` via
-# host.docker.internal. Set RABBITMQ_APP_PASSWORD to match the main backend .env.
+# AE Brain joins the main AnalEyes Docker network (analeyes_analeyes-net) so
+# hostname `rabbitmq` resolves to the backend broker. Local Postgres is reached
+# via the unique alias `aeb-postgres` on aeb-internal (avoids collision with
+# backend `postgres`). Set RABBITMQ_APP_PASSWORD to match backend .env.
 # =============================================================================
+
+networks:
+  aeb-internal:
+    driver: bridge
+  backend_analeyes_net:
+    external: true
+    name: analeyes_analeyes-net
 
 services:
   postgres:
     image: postgres:16
     container_name: aeb-postgres
+    profiles: ["app"]
+    networks:
+      aeb-internal:
+        aliases:
+          - aeb-postgres
     environment:
       POSTGRES_USER: ${AEB_DB_USER:-ae_brain}
       POSTGRES_PASSWORD: ${AEB_DB_PASSWORD:-ae_brain}
@@ -32,6 +46,8 @@ services:
     profiles: ["local-mq"]
     image: rabbitmq:3.13-management
     container_name: aeb-rabbitmq
+    networks:
+      - aeb-internal
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_ADMIN_USER:-admin}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_ADMIN_PASSWORD:-changeme}
@@ -51,6 +67,8 @@ services:
     profiles: ["local-mq"]
     image: curlimages/curl:8.5.0
     container_name: aeb-rabbitmq-bootstrap
+    networks:
+      - aeb-internal
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -72,26 +90,28 @@ services:
       dockerfile: Dockerfile
     image: ae-brain:latest
     container_name: aeb-app
+    profiles: ["app"]
+    networks:
+      - aeb-internal
+      - backend_analeyes_net
     depends_on:
       postgres:
         condition: service_healthy
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     environment:
       AEB_ENV: ${AEB_ENV:-dev}
       AEB_LOG_JSON: "true"
-      AEB_DB_HOST: postgres
+      AEB_DB_HOST: ${AEB_DB_HOST:-aeb-postgres}
       AEB_DB_PORT: "5432"
       AEB_DB_USER: ${AEB_DB_USER:-ae_brain}
       AEB_DB_PASSWORD: ${AEB_DB_PASSWORD:-ae_brain}
       AEB_DB_NAME: ${AEB_DB_NAME:-ae_brain}
-      AEB_AMQP_HOST: ${AEB_AMQP_HOST:-host.docker.internal}
+      AEB_AMQP_HOST: ${AEB_AMQP_HOST:-rabbitmq}
       AEB_AMQP_PORT: "5672"
-      AEB_INPUT_AMQP_URL: ${AEB_INPUT_AMQP_URL:-amqp://analeyes:${RABBITMQ_APP_PASSWORD:-analeyes_dev_secret}@host.docker.internal:5672/analeyes}
+      AEB_INPUT_AMQP_URL: ${AEB_INPUT_AMQP_URL:-amqp://analeyes:${RABBITMQ_APP_PASSWORD:-analeyes_dev_secret}@rabbitmq:5672/analeyes}
       AEB_INPUT_EXCHANGE: ${AEB_INPUT_EXCHANGE:-analeyes.events}
       AEB_INPUT_QUEUE: ${AEB_INPUT_QUEUE:-q_data_candidates_ai}
       AEB_INPUT_ROUTING_KEY: ${AEB_INPUT_ROUTING_KEY:-data.candidates.ai}
-      AEB_OUTPUT_AMQP_URL: ${AEB_OUTPUT_AMQP_URL:-amqp://analeyes:${RABBITMQ_APP_PASSWORD:-analeyes_dev_secret}@host.docker.internal:5672/analeyes}
+      AEB_OUTPUT_AMQP_URL: ${AEB_OUTPUT_AMQP_URL:-amqp://analeyes:${RABBITMQ_APP_PASSWORD:-analeyes_dev_secret}@rabbitmq:5672/analeyes}
       AEB_OUTPUT_EXCHANGE: ${AEB_OUTPUT_EXCHANGE:-analeyes.events}
       AEB_OUTPUT_ROUTING_KEY: ${AEB_OUTPUT_ROUTING_KEY:-signal.final}
       AEB_ALLOW_LEGACY_GUEST_VHOST: ${AEB_ALLOW_LEGACY_GUEST_VHOST:-false}
@@ -103,6 +123,8 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       AEB_WAIT_FOR_DEPS: "true"
       AEB_AUTO_INIT_DB: "true"
+      AEB_PUBLISH_SKIPPED_DECISIONS: ${AEB_PUBLISH_SKIPPED_DECISIONS:-false}
+      AEB_DISABLE_SIGNAL_DEDUP_IN_TEST_MODE: ${AEB_DISABLE_SIGNAL_DEDUP_IN_TEST_MODE:-false}
     volumes:
       - ./artifacts:/app/artifacts
       - ./data:/app/data

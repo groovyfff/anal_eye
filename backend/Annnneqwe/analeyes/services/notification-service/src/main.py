@@ -369,6 +369,7 @@ class NotificationServiceApp:
         await DatabaseManager.initialize(database_url=os.environ.get('DATABASE_URL'))
         await self._publisher.connect()
         self._loop = asyncio.get_running_loop()
+        self.sender.start_send_worker()
         self._start_consumer_thread()
         await self._wait_for_consumer_ready()
         logger.info('Notification service started; RabbitMQ consumers are registered')
@@ -516,6 +517,12 @@ class NotificationServiceApp:
         source_ai = normalized.get("source_ai")
         decision = normalized.get("decision")
 
+        logger.info(
+            "signal_final_received symbol=%s decision=%s source_ai=%s",
+            symbol,
+            decision,
+            source_ai,
+        )
         logger.info(
             "Resolved signal.final symbol=%s decision=%s source_ai=%s",
             symbol,

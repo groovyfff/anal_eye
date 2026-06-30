@@ -68,7 +68,7 @@ def gen_data(
 @app.command("gen-candidate")
 def gen_candidate(
     out: Path = typer.Option(Path("examples/candidate.json"), help="Output JSON path"),
-    symbol: str = typer.Option("BTCUSDT"),
+    symbol: str = typer.Option(..., help="Trading pair symbol (e.g. ETHUSDT, SOLUSDT)"),
     window: int = typer.Option(64, help="Number of candles to embed"),
     seed: int = typer.Option(11),
     asset_class: str = typer.Option(

@@ -33,6 +33,10 @@ class ServiceConfig:
     throttle_sec: int
     publish_on_candle_close: bool
     publish_on_every_update: bool
+    continuous_test_mode: bool
+    emit_interval_ms: int
+    emit_round_robin: bool
+    emit_require_min_candles: bool
     max_candles: int = 200
 
     @property
@@ -53,15 +57,13 @@ class ServiceConfig:
         return f"wss://fstream.binance.com/stream?streams={joined}"
 
     @classmethod
-    def from_env(cls) -> ServiceConfig:
-        symbols_raw = (os.environ.get("BINANCE_SYMBOLS") or "BTCUSDT").strip()
-        symbols = [part.strip().upper() for part in symbols_raw.split(",") if part.strip()]
+    def from_env(cls, *, symbols: list[str]) -> ServiceConfig:
         if not symbols:
-            symbols = ["BTCUSDT"]
+            raise ValueError("symbols must not be empty — set SYMBOLS or enable auto-discovery")
         publish_on_every_update = _env_bool("BINANCE_CANDIDATE_PUBLISH_ON_EVERY_UPDATE", False)
         return cls(
             enabled=_env_bool("BINANCE_CANDIDATE_ENABLED", True),
-            symbols=symbols,
+            symbols=[s.strip().upper() for s in symbols],
             timeframe=(os.environ.get("BINANCE_TIMEFRAME") or "1h").strip(),
             market=(os.environ.get("BINANCE_MARKET") or "futures").strip(),
             wss_base_url=(os.environ.get("BINANCE_WSS_BASE_URL") or "wss://fstream.binance.com/ws").strip().rstrip("/"),
@@ -73,4 +75,8 @@ class ServiceConfig:
             throttle_sec=_env_int("BINANCE_CANDIDATE_THROTTLE_SEC", 60),
             publish_on_candle_close=_env_bool("BINANCE_CANDIDATE_PUBLISH_ON_CANDLE_CLOSE", True),
             publish_on_every_update=publish_on_every_update,
+            continuous_test_mode=_env_bool("CANDIDATE_CONTINUOUS_TEST_MODE", False),
+            emit_interval_ms=_env_int("CANDIDATE_EMIT_INTERVAL_MS", 200),
+            emit_round_robin=_env_bool("CANDIDATE_EMIT_ROUND_ROBIN", True),
+            emit_require_min_candles=_env_bool("CANDIDATE_EMIT_REQUIRE_MIN_CANDLES", True),
         )

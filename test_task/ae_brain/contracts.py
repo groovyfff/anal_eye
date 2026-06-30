@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from ae_brain.symbols import extract_base_asset, require_symbol
+
 
 class Decision(str, Enum):
     LONG = "LONG"
@@ -100,8 +102,14 @@ class TradeCandidate:
             normalized.append(candle)
         return normalized
 
+    @property
+    def asset(self) -> str:
+        """Base asset derived from :attr:`symbol` (e.g. ``ETH`` from ``ETHUSDT``)."""
+        return extract_base_asset(self.symbol)
+
     @classmethod
     def from_message(cls, payload: dict[str, Any]) -> "TradeCandidate":
+        symbol = require_symbol(payload.get("symbol"))
         # Backward compatibility: legacy crypto producers publish without a
         # ``signal_log_db_id``. A missing or null id defaults to 0, which routes
         # the engine to the INSERT fallback instead of the backend UPDATE path.
@@ -125,7 +133,7 @@ class TradeCandidate:
         if payload.get("current_price") is not None:
             meta.setdefault("current_price", payload["current_price"])
         return cls(
-            symbol=str(payload["symbol"]),
+            symbol=symbol,
             interval=str(payload.get("interval", payload.get("timeframe", "5m"))),
             candles=cls._normalize_candles(list(raw_candles)),
             signal_log_db_id=signal_log_db_id,
@@ -196,9 +204,15 @@ class FinalSignal:
     ts: float = field(default_factory=time.time)
     version: str = "0.1.0"
 
+    @property
+    def asset(self) -> str:
+        """Base asset derived from :attr:`symbol` (e.g. ``ETH`` from ``ETHUSDT``)."""
+        return extract_base_asset(self.symbol)
+
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["decision"] = self.decision.value
+        d["asset"] = self.asset
         # --- tracker-service bridge (signal.final contract) ----------------
         # SignalTracker.start_tracking_signal reads tp/sl/entry_price/signal_id/
         # asset_class/signal_log_db_id/source_ai/signal_time. Expose them here
@@ -209,7 +223,8 @@ class FinalSignal:
         d["signal_type"] = self.decision.value
         d["reason_summary"] = (
             f"AE Brain {self.components.get('decision_source', 'fusion')}: "
-            f"{self.decision.value} (confidence={self.confidence:.3f})"
+            f"{self.decision.value} on {self.symbol} "
+            f"(asset={self.asset}, confidence={self.confidence:.3f})"
         )
         d["tp_price"] = self.take_profit
         d["sl_price"] = self.stop_loss

@@ -40,14 +40,12 @@ class ServiceConfig:
         return [self.stream_name(symbol) for symbol in self.symbols]
 
     @classmethod
-    def from_env(cls) -> ServiceConfig:
-        symbols_raw = (os.environ.get("BINANCE_SYMBOLS") or "BTCUSDT").strip()
-        symbols = [part.strip().upper() for part in symbols_raw.split(",") if part.strip()]
+    def from_env(cls, *, symbols: list[str]) -> ServiceConfig:
         if not symbols:
-            symbols = ["BTCUSDT"]
+            raise ValueError("symbols must not be empty — set SYMBOLS or enable auto-discovery")
         return cls(
             enabled=_env_bool("BINANCE_LIVE_ENABLED", True),
-            symbols=symbols,
+            symbols=[s.strip().upper() for s in symbols],
             timeframe=(os.environ.get("BINANCE_TIMEFRAME") or "1h").strip(),
             market=(os.environ.get("BINANCE_MARKET") or "futures").strip(),
             wss_base_url=(os.environ.get("BINANCE_WSS_BASE_URL") or "wss://fstream.binance.com/ws").strip().rstrip("/"),

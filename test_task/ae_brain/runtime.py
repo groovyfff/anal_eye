@@ -27,6 +27,8 @@ class LiveRuntime:
             min_composite_score=self._s.min_composite_score,
             models_loaded=self._engine.is_ready,
             telegram_cfg=self._s.telegram_debug,
+            publish_skipped_decisions=self._s.publish_skipped_decisions,
+            disable_signal_dedup_in_test_mode=self._s.disable_signal_dedup_in_test_mode,
         )
         self._stopping = asyncio.Event()
 

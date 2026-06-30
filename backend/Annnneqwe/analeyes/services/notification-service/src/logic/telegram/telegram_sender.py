@@ -18,6 +18,31 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+NON_ACTIONABLE_DECISIONS = frozenset(
+    {
+        "SKIP",
+        "WAIT",
+        "HOLD",
+        "NO_TRADE",
+        "FLAT",
+        "REJECTED",
+        "LOW_CONFIDENCE",
+        "FILTERED_OUT",
+    }
+)
+
+
+def _parse_telegram_group_id(value: Any) -> int | None:
+    """Parse Telegram chat/group id preserving leading minus for supergroups."""
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    raw = str(value).strip()
+    if not raw:
+        return None
+    return int(raw)
+
 
 class TelegramDeliveryError(RuntimeError):
     """Raised when Telegram delivery fails after retries."""
@@ -50,7 +75,10 @@ class TelegramSender:
     def __init__(self, config: dict[str, Any]) -> None:
         telegram_cfg = config.get("telegram", {}) or {}
         env_group = os.environ.get("TELEGRAM_GROUP_ID", "").strip()
-        self.group_id = int(env_group) if env_group else telegram_cfg.get("group_id")
+        parsed_group = _parse_telegram_group_id(env_group) if env_group else None
+        self.group_id = parsed_group if parsed_group is not None else _parse_telegram_group_id(
+            telegram_cfg.get("group_id")
+        )
         self.asset_class_topics = telegram_cfg.get("asset_class_topics", {}) or {}
         self.ai_specific_topics = telegram_cfg.get("ai_specific_topics", {}) or {}
         self.bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -61,6 +89,86 @@ class TelegramSender:
             "true",
             "yes",
         }
+        self._send_interval_ms = max(1, int(os.environ.get("TELEGRAM_SEND_INTERVAL_MS", "200")))
+        self._send_skipped_decisions = os.environ.get(
+            "NOTIFICATION_SEND_SKIPPED_DECISIONS", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._disable_dedup_in_test_mode = os.environ.get(
+            "NOTIFICATION_DISABLE_DEDUP_IN_TEST_MODE", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._send_queue: asyncio.Queue[tuple[str, dict[str, Any], asyncio.Future[Any]]] | None = None
+        self._send_worker_task: asyncio.Task[None] | None = None
+
+    def start_send_worker(self) -> None:
+        """Start the single sequential Telegram send worker (200 ms between sends)."""
+        if self._send_worker_task is not None and not self._send_worker_task.done():
+            return
+        self._send_queue = asyncio.Queue()
+        self._send_worker_task = asyncio.create_task(self._send_worker_loop(), name="telegram-send-worker")
+        logger.info(
+            "Telegram send worker started interval_ms=%s",
+            self._send_interval_ms,
+        )
+
+    async def _send_worker_loop(self) -> None:
+        assert self._send_queue is not None
+        interval_sec = self._send_interval_ms / 1000.0
+        while True:
+            method, payload, future = await self._send_queue.get()
+            try:
+                result = await self._post_telegram_direct(method, payload)
+                if not future.done():
+                    future.set_result(result)
+            except Exception as exc:
+                logger.error(
+                    "Telegram queued send failed method=%s chat_id=%s err=%s",
+                    method,
+                    payload.get("chat_id"),
+                    exc,
+                )
+                if not future.done():
+                    future.set_exception(exc)
+            finally:
+                logger.debug("telegram_queue_sleep interval_ms=%s", self._send_interval_ms)
+                await asyncio.sleep(interval_sec)
+                self._send_queue.task_done()
+
+    async def _enqueue_post_telegram(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+        logger.info(
+            "telegram_enqueue chat_id=%s",
+            payload.get("chat_id"),
+        )
+        if self._send_queue is None:
+            return await self._post_telegram_direct(method, payload)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        await self._send_queue.put((method, payload, future))
+        return await future
+
+    @staticmethod
+    def _is_non_actionable_decision(decision: Any) -> bool:
+        return str(decision or "").upper() in NON_ACTIONABLE_DECISIONS
+
+    def should_notify(self, payload: dict[str, Any]) -> bool:
+        decision = payload.get("decision")
+        if self._disable_dedup_in_test_mode:
+            logger.info(
+                "notification_dedup_bypassed symbol=%s decision=%s",
+                payload.get("symbol"),
+                decision,
+            )
+        if self._is_non_actionable_decision(decision):
+            return self._send_skipped_decisions
+        return True
+
+    @staticmethod
+    def _decision_emoji(decision: Any) -> str:
+        value = str(decision or "").upper()
+        if value == "LONG":
+            return "🟢"
+        if value == "SHORT":
+            return "🔴"
+        return "⚪"
 
     @staticmethod
     def normalize_signal_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -108,9 +216,14 @@ class TelegramSender:
             payload["message_thread_id"] = topic_id
         return payload
 
-    async def _post_telegram(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _post_telegram_direct(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
         last_exc: Exception | None = None
+        logger.info(
+            "telegram_send_attempt method=%s chat_id=%s",
+            method,
+            payload.get("chat_id"),
+        )
 
         for attempt in range(1, self.retry_attempts + 1):
             try:
@@ -127,6 +240,11 @@ class TelegramSender:
                             continue
                         logger.error("Telegram API %s rejected: %s", method, desc)
                         raise TelegramDeliveryError(f"Telegram API {method} rejected: {desc}")
+                    logger.info(
+                        "telegram_send_success method=%s chat_id=%s",
+                        method,
+                        payload.get("chat_id"),
+                    )
                     return data
             except TelegramDeliveryError:
                 raise
@@ -166,12 +284,20 @@ class TelegramSender:
 
     def _format_signal_message(self, payload: dict[str, Any]) -> str:
         asset_class = str(payload.get("asset_class", "crypto"))
+        symbol = payload.get("symbol") or payload.get("name") or "UNKNOWN"
+        asset = payload.get("asset")
+        display = f"{symbol} ({asset})" if asset and asset != symbol else str(symbol)
+        decision = str(payload.get("decision") or "UNKNOWN").upper()
+        emoji = self._decision_emoji(decision)
         features = payload.get("features") or {}
         lines = [
-            f"🚀 *{payload.get('name') or payload.get('symbol')}* ({asset_class})",
-            f"Direction: *{payload.get('decision')}* | Confidence: {payload.get('confidence')}",
-            f"Entry: {_format_price(payload.get('entry_price'))} | TP: {_format_price(payload.get('tp'))} | SL: {_format_price(payload.get('sl'))}",
+            f"{emoji} *{display}* ({asset_class})",
+            f"Decision: *{decision}* | Confidence: {payload.get('confidence')}",
         ]
+        if not self._is_non_actionable_decision(decision):
+            lines.append(
+                f"Entry: {_format_price(payload.get('entry_price'))} | TP: {_format_price(payload.get('tp'))} | SL: {_format_price(payload.get('sl'))}"
+            )
         if asset_class == "crypto":
             for key in ("funding_rate", "open_interest_z", "cvd"):
                 if features.get(key) is not None:
@@ -180,7 +306,7 @@ class TelegramSender:
             for key in ("rsi", "macd_hist", "vol_rel"):
                 if features.get(key) is not None:
                     lines.append(f"{key}: {features[key]}")
-        reason = payload.get("reason")
+        reason = payload.get("reason") or payload.get("skip_reason") or payload.get("reason_summary")
         if reason:
             lines.append(f"Reason: {reason}")
         return "\n".join(lines)
@@ -242,6 +368,20 @@ class TelegramSender:
             )
             return SendResult(sent=False, skip_reason=skip)
 
+        if not self.should_notify(payload):
+            logger.info(
+                "Telegram signal skipped symbol=%s decision=%s reason=skipped_decisions_disabled",
+                symbol,
+                decision,
+            )
+            return SendResult(sent=False, skip_reason="skipped_decisions_disabled")
+
+        logger.info(
+            "telegram_enqueue symbol=%s decision=%s",
+            symbol,
+            decision,
+        )
+
         text = self._format_signal_message(payload)
         chart = self._generate_signal_chart_image(payload)
         if chart is None and payload.get("historical_ohlcv"):
@@ -251,7 +391,7 @@ class TelegramSender:
             )
 
         try:
-            await self._post_telegram("sendMessage", self._build_message_payload(text, topic_id))
+            await self._enqueue_post_telegram("sendMessage", self._build_message_payload(text, topic_id))
         except TelegramDeliveryError:
             logger.exception(
                 "Telegram API failed for signal symbol=%s decision=%s source_ai=%s",
@@ -259,7 +399,7 @@ class TelegramSender:
                 decision,
                 source_ai,
             )
-            raise
+            return SendResult(sent=False, skip_reason="telegram_api_failed")
         except Exception:
             logger.exception(
                 "Telegram send failed for signal symbol=%s decision=%s source_ai=%s",
@@ -267,11 +407,12 @@ class TelegramSender:
                 decision,
                 source_ai,
             )
-            raise
+            return SendResult(sent=False, skip_reason="telegram_send_failed")
 
         logger.info(
-            "Telegram signal sent symbol=%s topic_id=%s chart=%s",
+            "Telegram signal sent symbol=%s decision=%s topic_id=%s chart=%s",
             symbol,
+            decision,
             topic_id,
             bool(chart),
         )
@@ -298,7 +439,16 @@ class TelegramSender:
             f"Status: *{status}*\n"
             f"PnL: {payload.get('pnl_percent')}%"
         )
-        await self._post_telegram("sendMessage", self._build_message_payload(text, topic_id))
+        try:
+            await self._enqueue_post_telegram("sendMessage", self._build_message_payload(text, topic_id))
+        except Exception as exc:
+            logger.exception(
+                "Telegram outcome send failed symbol=%s status=%s err=%s",
+                payload.get("symbol"),
+                payload.get("status"),
+                exc,
+            )
+            return SendResult(sent=False, skip_reason="telegram_send_failed")
         return SendResult(sent=True)
 
     async def send_entry_event_notification(self, payload: dict[str, Any]) -> SendResult:
@@ -318,7 +468,15 @@ class TelegramSender:
             f"✅ *Entry* {payload.get('symbol')}\n"
             f"Fill price: {_format_price(payload.get('fill_price'))}"
         )
-        await self._post_telegram("sendMessage", self._build_message_payload(text, topic_id))
+        try:
+            await self._enqueue_post_telegram("sendMessage", self._build_message_payload(text, topic_id))
+        except Exception as exc:
+            logger.exception(
+                "Telegram entry send failed symbol=%s err=%s",
+                payload.get("symbol"),
+                exc,
+            )
+            return SendResult(sent=False, skip_reason="telegram_send_failed")
         return SendResult(sent=True)
 
     # Back-compat aliases used by main.py

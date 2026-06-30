@@ -59,7 +59,10 @@ Forbidden (never published): `decision`, `signal_type`, `side`, `heuristic_signa
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BINANCE_CANDIDATE_ENABLED` | `true` | Enable service |
-| `BINANCE_SYMBOLS` | `BTCUSDT` | Comma-separated symbols |
+| `SYMBOLS` | *(empty)* | Manual comma-separated symbols; when set, overrides auto-discovery |
+| `BINANCE_SYMBOLS` | *(empty)* | Legacy alias for `SYMBOLS` |
+| `SYMBOL_LIMIT` | `200` | Top-N symbols by 24h quote volume when auto-discovering |
+| `QUOTE_ASSET` | `USDT` | Quote asset filter for auto-discovery |
 | `BINANCE_TIMEFRAME` | `1h` | Kline interval |
 | `BINANCE_MARKET` | `futures` | Market label |
 | `BINANCE_WSS_BASE_URL` | `wss://fstream.binance.com/ws` | WSS base (mirror: `wss://fstream.binancefuture.com/ws`) |
@@ -69,6 +72,10 @@ Forbidden (never published): `decision`, `signal_type`, `side`, `heuristic_signa
 | `BINANCE_CANDIDATE_PUBLISH_ON_EVERY_UPDATE` | `false` | Publish every WSS frame |
 | `BINANCE_BOOTSTRAP_LIMIT` | `200` | One-time REST kline limit |
 | `BINANCE_REST_BASE_URL` | `https://fapi.binance.com` | REST bootstrap host |
+| `CANDIDATE_CONTINUOUS_TEST_MODE` | `false` | DEV/TEST: round-robin publish from in-memory buffers |
+| `CANDIDATE_EMIT_INTERVAL_MS` | `200` | Delay between continuous test publishes |
+| `CANDIDATE_EMIT_ROUND_ROBIN` | `true` | Rotate one symbol per tick |
+| `CANDIDATE_EMIT_REQUIRE_MIN_CANDLES` | `true` | Skip symbols below min candle count |
 
 ## How to start
 

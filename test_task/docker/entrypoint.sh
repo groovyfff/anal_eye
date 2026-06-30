@@ -24,7 +24,7 @@ wait_for() {
 }
 
 if [[ "${AEB_WAIT_FOR_DEPS:-true}" == "true" ]]; then
-    wait_for "${AEB_DB_HOST:-postgres}" "${AEB_DB_PORT:-5432}" "postgres"
+    wait_for "${AEB_DB_HOST:-aeb-postgres}" "${AEB_DB_PORT:-5432}" "aeb-postgres"
     wait_for "${AEB_AMQP_HOST:-rabbitmq}" "${AEB_AMQP_PORT:-5672}" "rabbitmq"
 fi
 

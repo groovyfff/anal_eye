@@ -19,6 +19,7 @@ from ae_brain.config import AmqpInputConfig, AmqpOutputConfig, TelegramDebugConf
 from ae_brain.contracts import Decision, FinalSignal, TradeCandidate
 from ae_brain.messaging.amqp_utils import assert_analeyes_amqp, log_endpoint, parse_amqp_url
 from ae_brain.messaging.candidate_normalizer import normalize_candidate
+from ae_brain.messaging.skip_reason import extract_skip_reason
 from ae_brain.utils.logging import get_logger
 
 log = get_logger("ae_brain.amqp")
@@ -31,8 +32,8 @@ def _build_reason_summary(signal: FinalSignal) -> str:
     source = components.get("decision_source", "ae_brain")
     ev_usd = signal.expected_value_usd
     return (
-        f"AE Brain {source}: {signal.decision.value} "
-        f"(confidence={signal.confidence:.3f}, ev_usd={ev_usd:.2f})"
+        f"AE Brain {source}: {signal.decision.value} on {signal.symbol} "
+        f"(asset={signal.asset}, confidence={signal.confidence:.3f}, ev_usd={ev_usd:.2f})"
     )
 
 
@@ -43,7 +44,9 @@ def build_signal_final_payload(signal: FinalSignal, candidate: TradeCandidate) -
     payload["reason_summary"] = _build_reason_summary(signal)
     payload["tp_price"] = signal.take_profit
     payload["sl_price"] = signal.stop_loss
-    payload["consensus_achieved"] = True
+    payload["consensus_achieved"] = signal.decision in (Decision.LONG, Decision.SHORT)
+    if signal.decision == Decision.SKIP:
+        payload["skip_reason"] = extract_skip_reason(signal)
     payload["features"] = candidate.meta.get("features") or {}
     payload["candles"] = candidate.candles
     if candidate.meta.get("composite_score") is not None:
@@ -61,6 +64,8 @@ class SignalBroker:
         min_composite_score: float = 0.0,
         models_loaded: Callable[[], bool] | None = None,
         telegram_cfg: TelegramDebugConfig | None = None,
+        publish_skipped_decisions: bool = False,
+        disable_signal_dedup_in_test_mode: bool = False,
     ) -> None:
         self._input_cfg = input_cfg
         self._output_cfg = output_cfg
@@ -68,6 +73,8 @@ class SignalBroker:
         self._min_composite_score = min_composite_score
         self._models_loaded = models_loaded or (lambda: True)
         self._telegram_cfg = telegram_cfg or TelegramDebugConfig()
+        self._publish_skipped_decisions = publish_skipped_decisions
+        self._disable_signal_dedup = disable_signal_dedup_in_test_mode
         self._input_connection = None
         self._output_connection = None
         self._input_channel = None
@@ -140,7 +147,20 @@ class SignalBroker:
             routing_key=self._output_cfg.routing_key,
             output_host=self._output_endpoint.host,
             output_vhost=self._output_endpoint.vhost,
+            event="signal_final_published",
         )
+
+    def _should_publish_signal(self, signal: FinalSignal, candidate: TradeCandidate) -> bool:
+        if self._disable_signal_dedup:
+            log.info(
+                "signal_dedup_bypassed",
+                symbol=signal.symbol,
+                decision=signal.decision.value,
+                reason="AEB_DISABLE_SIGNAL_DEDUP_IN_TEST_MODE",
+            )
+        if signal.decision != Decision.SKIP:
+            return True
+        return self._publish_skipped_decisions
 
     async def consume(self, handler: SignalHandler) -> None:
         import aio_pika
@@ -221,6 +241,12 @@ class SignalBroker:
                 candidate = TradeCandidate.from_message(norm.payload or {})
                 features = candidate.meta.get("features") or {}
                 log.info(
+                    "candidate_received",
+                    symbol=candidate.symbol,
+                    asset_class=candidate.asset_class,
+                    candles_count=len(candidate.candles),
+                )
+                log.info(
                     "AEBrain normalized candidate",
                     symbol=candidate.symbol,
                     asset_class=candidate.asset_class,
@@ -259,6 +285,12 @@ class SignalBroker:
                     return
 
                 log.info(
+                    "decision_created",
+                    symbol=signal.symbol,
+                    decision=signal.decision.value,
+                    confidence=signal.confidence,
+                )
+                log.info(
                     "AEBrain result",
                     symbol=signal.symbol,
                     decision=signal.decision.value,
@@ -266,16 +298,25 @@ class SignalBroker:
                     reason=_build_reason_summary(signal)[:120],
                 )
 
-                if signal.decision == Decision.SKIP:
+                if not self._should_publish_signal(signal, candidate):
                     log.info(
                         "AEBrain decided SKIP",
                         symbol=signal.symbol,
                         reason=_build_reason_summary(signal),
+                        publish_skipped_decisions=self._publish_skipped_decisions,
                     )
                     await message.ack()
                     acked = True
                     log.info("skipped_and_acked", symbol=signal.symbol)
                     return
+
+                if signal.decision == Decision.SKIP and self._publish_skipped_decisions:
+                    log.info(
+                        "skipped_decision_published",
+                        enabled=True,
+                        symbol=signal.symbol,
+                        skip_reason=extract_skip_reason(signal),
+                    )
 
                 try:
                     await self.publish_signal(signal, candidate)

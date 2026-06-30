@@ -30,6 +30,10 @@ def build_candidate_payload(
     event_time: int,
     candles: list[Candle],
 ) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    if not normalized_symbol:
+        raise ValueError("missing_symbol")
+
     features = compute_features(candles)
     current_price = float(features["current_price"])
     market_state = infer_market_state(features, current_price)
@@ -37,9 +41,10 @@ def build_candidate_payload(
 
     payload: dict[str, Any] = {
         "source": "binance",
+        "exchange": "binance",
         "market": market,
         "asset_class": "crypto",
-        "symbol": symbol.upper(),
+        "symbol": normalized_symbol,
         "timeframe": timeframe,
         "event_time": event_time,
         "current_price": current_price,

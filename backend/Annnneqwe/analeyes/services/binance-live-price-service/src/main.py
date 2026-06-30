@@ -5,6 +5,7 @@ import logging
 import sys
 
 from dotenv import load_dotenv
+from shared.binance_symbols import resolve_binance_symbols
 from shared.rabbitmq_config import resolve_rabbitmq_url
 
 from src.amqp_safety import validate_rabbitmq_credentials
@@ -26,7 +27,14 @@ def _configure_logging() -> None:
 
 
 async def _run() -> None:
-    config = ServiceConfig.from_env()
+    loop = asyncio.get_running_loop()
+    symbols = await loop.run_in_executor(
+        None,
+        lambda: resolve_binance_symbols(
+            rest_base_url=(__import__("os").environ.get("BINANCE_REST_BASE_URL") or "https://fapi.binance.com"),
+        ),
+    )
+    config = ServiceConfig.from_env(symbols=symbols)
     if not config.enabled:
         logger.info("BINANCE_LIVE_ENABLED=false — Binance live-price publisher idle")
         await asyncio.Event().wait()

@@ -261,6 +261,12 @@ class Settings(BaseSettings):
     fusion: FusionConfig = Field(default_factory=FusionConfig)
 
     enable_chromadb_rag: bool = False
+    publish_skipped_decisions: bool = Field(
+        default=False, validation_alias="AEB_PUBLISH_SKIPPED_DECISIONS"
+    )
+    disable_signal_dedup_in_test_mode: bool = Field(
+        default=False, validation_alias="AEB_DISABLE_SIGNAL_DEDUP_IN_TEST_MODE"
+    )
 
     @model_validator(mode="after")
     def _resolve_amqp_urls(self) -> "Settings":

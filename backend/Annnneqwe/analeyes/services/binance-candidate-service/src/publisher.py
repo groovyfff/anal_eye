@@ -31,6 +31,11 @@ class CandidatePublisher:
         await self.connect()
 
     async def publish_candidate(self, payload: dict[str, Any]) -> None:
+        symbol = str(payload.get("symbol") or "").strip().upper()
+        if not symbol:
+            logger.error("Skipping candidate publish reason=missing_symbol keys=%s", list(payload.keys()))
+            raise ValueError("missing_symbol")
+        payload["symbol"] = symbol
         body = json.dumps(payload, ensure_ascii=False)
         try:
             await self._client.publish_async(EXCHANGE, RoutingKey.DATA_CANDIDATES_AI, body)
@@ -42,6 +47,11 @@ class CandidatePublisher:
             )
             await self.reconnect()
             await self._client.publish_async(EXCHANGE, RoutingKey.DATA_CANDIDATES_AI, body)
+        logger.info(
+            "rabbitmq_publish_success routing_key=%s symbol=%s",
+            RoutingKey.DATA_CANDIDATES_AI,
+            symbol,
+        )
 
     async def close(self) -> None:
         await self._client.close()

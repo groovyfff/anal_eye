@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from src.candle_buffer import Candle, CandleBuffer
 from src.candidate_builder import assert_no_forbidden_fields, build_candidate_payload
 from src.indicators import compute_features
@@ -87,3 +89,26 @@ def test_candidate_schema_and_no_forbidden_fields() -> None:
     assert_no_forbidden_fields(payload)
     for key in ("decision", "signal_type", "side", "entry_price", "tp_price", "sl_price"):
         assert key not in payload
+
+
+@pytest.mark.parametrize("symbol", ["ETHUSDT", "SOLUSDT", "BNBUSDT"])
+def test_candidate_builder_preserves_dynamic_symbol(symbol: str) -> None:
+    payload = build_candidate_payload(
+        symbol=symbol,
+        market="futures",
+        timeframe="1h",
+        event_time=1_700_000_000_000,
+        candles=_make_candles(100, start=3000.0),
+    )
+    assert payload["symbol"] == symbol
+
+
+def test_candidate_builder_rejects_missing_symbol() -> None:
+    with pytest.raises(ValueError, match="missing_symbol"):
+        build_candidate_payload(
+            symbol="",
+            market="futures",
+            timeframe="1h",
+            event_time=1,
+            candles=_make_candles(10),
+        )

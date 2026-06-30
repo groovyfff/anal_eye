@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ae_brain.contracts import AssetClass
+from ae_brain.symbols import normalize_symbol
 
 # Pre-filled decision fields are stripped; AE Brain must compute direction itself.
 _STRIP_KEYS = frozenset(
@@ -92,8 +93,11 @@ def normalize_candidate(
     for key in _STRIP_KEYS:
         payload.pop(key, None)
 
-    symbol = _first(payload.get("symbol"))
-    if not symbol:
+    symbol_raw = _first(payload.get("symbol"))
+    if not symbol_raw:
+        return NormalizeResult(skip_reason="missing_symbol", summary=_summary(payload))
+    symbol = normalize_symbol(str(symbol_raw))
+    if symbol == "UNKNOWN":
         return NormalizeResult(skip_reason="missing_symbol", summary=_summary(payload))
 
     asset_class_raw = _first(payload.get("asset_class"), payload.get("feat_asset_class"), "crypto")
