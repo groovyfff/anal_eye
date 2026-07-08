@@ -1,36 +1,26 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.eggs/
-build/
-dist/
+# AE Brain local runtime (root .gitignore covers most patterns)
 
-# Virtual envs
-.venv/
-venv/
-env/
-
-# Model artifacts & data (regenerate via the CLI)
+# Training / promotion outputs
 artifacts/
+artifacts_*/
+artifacts_candidates/
+artifacts_backups/
+artifacts_backup_*/
+
+# Local datasets
 data/
-*.joblib
-*.pt
-*.onnx
-*.zip
-*.npz
+datasets/
+market_data/
+candles/
+klines/
+historical_data/
+raw_data/
+processed_data/
 
-# Local config / secrets
+# Secrets
 .env
+.env.*
+!.env.example
 
-# Tooling
-.pytest_cache/
-.ruff_cache/
-.mypy_cache/
-
-#Logs
-*.log
-
-#OS Trash
-.DS_Store
-Thumbs.db
+# Keep small committed examples
+!examples/

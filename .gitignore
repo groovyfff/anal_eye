@@ -1,26 +1,166 @@
-# Виртуальные окружения
+# =============================================================================
+# AnalEyes — secrets, runtime state, ML artifacts, caches (keep source tracked)
+# =============================================================================
+
+# --- Secrets / local env (keep .env.example) ---------------------------------
+.env
+.env.*
+!.env.example
+*.local
+*.secret
+*secret*
+*token*
+*credentials*
+
+# --- Python bytecode / tooling caches -----------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.hypothesis/
+.tox/
+.nox/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ipynb_checkpoints/
+.pdm-python/
+.pdm-build/
+.pixi/
+
+# --- Virtual environments -----------------------------------------------------
 .venv/
 .venv-test/
 venv/
 env/
+ENV/
+env.bak/
+venv.bak/
 
-# Кэш Python и тестов
-__pycache__/
-*.pyc
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Логи и базы данных
+# --- Logs / temp / generic cache ----------------------------------------------
 *.log
-.pre-commit-config.yaml
-.env
+logs/
+tmp/
+temp/
+.cache/
 
-# Специфичные файлы вашей ML-модели
+# --- ML training outputs / experiment tracking --------------------------------
 artifacts/
-*.pt
-*.onnx
-*.pkl
+artifacts_*/
+artifacts_candidates/
+artifacts_backups/
+artifacts_backup_*/
+runs/
+outputs/
+reports/
+training_runs/
+checkpoints/
+models/
+model_artifacts/
+mlruns/
+wandb/
 
-# Системные файлы
+# --- Downloaded / generated datasets ------------------------------------------
+data/
+datasets/
+market_data/
+candles/
+klines/
+historical_data/
+raw_data/
+processed_data/
+
+# Dataset file formats (allow committed fixtures under tests/fixtures or examples)
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.npy
+*.npz
+!tests/fixtures/**
+!**/tests/fixtures/**
+!examples/**
+!**/examples/**
+
+# --- Serialized models (allow committed fixtures) -----------------------------
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+!tests/fixtures/**
+!**/tests/fixtures/**
+!examples/**
+!**/examples/**
+
+# --- SQLite / local DB runtime files ------------------------------------------
+*.sqlite
+*.sqlite3
+*.db
+candidate_dedup.db
+news_sources_state.db
+
+# --- Vector DB local stores ---------------------------------------------------
+chroma/
+chroma_db/
+qdrant_storage/
+vector_db/
+
+# --- Telegram / Twitter session state -----------------------------------------
+*.session
+*.session-journal
+telethon.session*
+storage_state.json
+twitter_storage_state*.json
+
+# --- Generated charts / images ------------------------------------------------
+*.png
+*.jpg
+*.jpeg
+*.webp
+/tmp/analeyes_charts/
+analeyes_charts/
+
+# --- Docker / service local volumes -------------------------------------------
+docker-data/
+*_data/
+postgres_data/
+rabbitmq_data/
+binance_candidate_data/
+news_service_data/
+mnesia/
+rabbitmq/
+rabbitmq-data/
+activemq-data/
+
+# --- DB dumps / backups -------------------------------------------------------
+backups/
+*.sql
+
+# --- OS / editor junk ---------------------------------------------------------
 .DS_Store
+Thumbs.db
+.directory
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# --- Streamlit / tool secrets -------------------------------------------------
+.streamlit/secrets.toml
+.pypirc

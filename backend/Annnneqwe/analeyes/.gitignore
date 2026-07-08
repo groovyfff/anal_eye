@@ -1,2 +1,16 @@
-# Local secrets — never commit (see setup-env.sh to create from .env.example).
+# Local secrets — create from .env.example via setup-env.sh
 .env
+.env.*
+!.env.example
+
+# Service runtime / generated outputs
+/tmp/
+analeyes_charts/
+candidate_dedup.db
+news_sources_state.db
+docker-data/
+binance_candidate_data/
+backups/
+*.sql
+logs/
+*.log
