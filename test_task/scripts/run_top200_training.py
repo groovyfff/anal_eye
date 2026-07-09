@@ -165,6 +165,17 @@ def main() -> None:
     parser.add_argument("--end", default="now")
     parser.add_argument("--sample-per-symbol", type=int, default=12_000)
     parser.add_argument("--meta-mode", default="side_specialists")
+    parser.add_argument("--balance-side-specialists", default="true", choices=["true", "false"],
+                        help="Enable class balancing for side specialists (default true for top200)")
+    parser.add_argument("--long-positive-weight", default="auto",
+                        help="LONG profitable-class weight: 'auto' (neg/pos imbalance) or a float")
+    parser.add_argument("--short-positive-weight", default="auto",
+                        help="SHORT profitable-class weight: 'auto' (neg/pos imbalance) or a float")
+    parser.add_argument("--balance-train-samples", default="true", choices=["true", "false"],
+                        help="Balance (undersample) the majority class within the train split only (default true)")
+    parser.add_argument("--max-side-train-samples-per-class", type=int, default=None)
+    parser.add_argument("--allow-skip-sequence", default="true", choices=["true", "false"],
+                        help="Memory-safe: skip sequence training if too heavy/fails (default true for top200)")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-train", action="store_true")
     args = parser.parse_args()
@@ -249,8 +260,23 @@ def main() -> None:
             "--medium",
             "--sample-per-symbol",
             str(args.sample_per_symbol),
+            "--balance-side-specialists",
+            args.balance_side_specialists,
+            "--long-positive-weight",
+            args.long_positive_weight,
+            "--short-positive-weight",
+            args.short_positive_weight,
+            "--balance-train-samples",
+            args.balance_train_samples,
+            "--allow-skip-sequence",
+            args.allow_skip_sequence,
             "--skip-evaluate",
         ]
+        if args.max_side_train_samples_per_class is not None:
+            train_cmd.extend([
+                "--max-side-train-samples-per-class",
+                str(args.max_side_train_samples_per_class),
+            ])
         run_subprocess(train_cmd, logger=logger)
         state["training_done"] = True
         save_state(state_path, state)

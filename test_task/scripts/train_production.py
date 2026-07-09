@@ -39,7 +39,24 @@ from ae_brain.config import Settings
 from ae_brain.features.engineering import FeatureEngineer
 from ae_brain.features.regime import REGIME_INPUT_FEATURES, RegimeModel
 from ae_brain.features.schema import FEATURE_NAMES, REGIME_ONEHOT_NAMES
-from ae_brain.layers.meta import MetaModel, build_meta_features
+from ae_brain.layers.meta import (
+    CLASS_LONG,
+    CLASS_SHORT,
+    CLASS_SKIP,
+    MetaModel,
+    TwoStageMetaModel,
+    build_meta_features,
+)
+from ae_brain.layers.side_aware import (
+    SOURCE_MODES,
+    SideAwareConfig,
+    save_side_aware_config,
+    score_source_on_validation,
+    select_sources_on_validation,
+)
+from ae_brain.layers.side_specialists import SideSpecialistModel
+from ae_brain.training.calibration import ConfidenceCalibrator, SideCalibrators
+from ae_brain.training.labels import LabelConfig, ev_aware_directional_labels
 from ae_brain.layers.sequence import SEQ_CHANNELS, SequencePredictor
 from ae_brain.layers.tabular import TabularPredictor
 from ae_brain.training.dataset import (
@@ -47,6 +64,7 @@ from ae_brain.training.dataset import (
     relative_vol_scale,
     triple_barrier_labels,
 )
+from ae_brain.symbols import default_allowed_symbols_csv
 from ae_brain.utils.logging import get_logger
 
 log = get_logger("ae_brain.train_production")
@@ -70,7 +88,9 @@ class SymbolData:
     chan_frame: pd.DataFrame  # df augmented with regime columns (for SEQ_CHANNELS)
 
 
-def _load_symbol_frames(data_dir: Path, symbols: list[str], interval: str) -> dict[str, pd.DataFrame]:
+def _load_symbol_frames(
+    data_dir: Path, symbols: list[str], interval: str, *, sample_per_symbol: int | None = None
+) -> dict[str, pd.DataFrame]:
     frames: dict[str, pd.DataFrame] = {}
     for sym in symbols:
         path = data_dir / f"{sym}_{interval}.csv"
@@ -80,6 +100,8 @@ def _load_symbol_frames(data_dir: Path, symbols: list[str], interval: str) -> di
         df = pd.read_csv(path)
         if "ts" in df:
             df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
+        if sample_per_symbol and len(df) > sample_per_symbol:
+            df = df.iloc[-sample_per_symbol:].reset_index(drop=True)
         frames[sym] = df
         log.info("train.production.loaded", symbol=sym, rows=len(df))
     if not frames:
@@ -404,8 +426,35 @@ def _rl_series(model, X, atr, prices):
     return np.clip(np.asarray(act).reshape(-1), -1.0, 1.0)
 
 
-def train_meta_multi(sym_data, settings, tab_predictor, seq_module, seq_mean, seq_std,
-                     seq_device, seq_window, rl_model):
+def _build_layer_mask(settings: Settings, seq_metrics: dict, rl_metrics: dict) -> dict[str, bool]:
+    seq_auc = float(seq_metrics.get("val_auc", 0.0) or 0.0)
+    rl_reward = float(rl_metrics.get("mean_episode_reward", -1.0) or -1.0)
+    mask = {
+        "tabular": True,
+        "sequence": seq_auc >= settings.fusion.min_sequence_val_auc,
+        "rl": rl_reward >= settings.fusion.min_rl_mean_reward,
+    }
+    log.info(
+        "train.production.layer_mask",
+        mask=mask,
+        seq_val_auc=seq_auc,
+        rl_mean_reward=rl_reward,
+    )
+    return mask
+
+
+def _collect_meta_dataset(
+    sym_data,
+    settings,
+    tab_predictor,
+    seq_module,
+    seq_mean,
+    seq_std,
+    seq_device,
+    seq_window,
+    rl_model,
+    layer_mask: dict[str, bool],
+):
     Fs, ys = [], []
     for sym, sd in sym_data.items():
         n = len(sd.X)
@@ -414,45 +463,597 @@ def train_meta_multi(sym_data, settings, tab_predictor, seq_module, seq_mean, se
         if end <= start:
             continue
         labels = directional_barrier_labels(
-            sd.df, sd.atr, tp_mult=settings.risk.atr_tp_mult, sl_mult=settings.risk.atr_sl_mult,
-            horizon=_TB_HORIZON, vol_scale=sd.vol_scale,
+            sd.df,
+            sd.atr,
+            tp_mult=settings.risk.atr_tp_mult,
+            sl_mult=settings.risk.atr_sl_mult,
+            horizon=_TB_HORIZON,
+            vol_scale=sd.vol_scale,
         )
         tab_p = tab_predictor._calibrator.predict_proba(sd.X[:, tab_predictor._kept_idx])[:, 1]
         p_cont, trend = _seq_series(seq_module, seq_mean, seq_std, sd.chan_frame, seq_window, seq_device)
         rl_expo = _rl_series(rl_model, sd.X, sd.atr, sd.prices)
         for i in range(start, end):
-            Fs.append(build_meta_features(tab_p[i], p_cont[i], trend[i], rl_expo[i], sd.regime_oh[i]))
+            Fs.append(
+                build_meta_features(
+                    tab_p[i], p_cont[i], trend[i], rl_expo[i], sd.regime_oh[i], layer_mask=layer_mask
+                )
+            )
             ys.append(int(labels[i]))
         log.info("train.production.meta.symbol", symbol=sym, n=end - start)
+    return np.asarray(Fs, dtype=np.float32), np.asarray(ys, dtype=np.int64)
 
-    F = np.asarray(Fs, dtype=np.float32)
-    y = np.asarray(ys, dtype=np.int64)
-    meta = MetaModel(model_kind="logreg")
-    metrics = meta.fit(F, y)
-    meta.save(settings.model.artifacts_dir)
-    return metrics
+
+def _collect_side_specialist_dataset(
+    sym_data,
+    settings,
+    tab_predictor,
+    seq_module,
+    seq_mean,
+    seq_std,
+    seq_device,
+    seq_window,
+    rl_model,
+    layer_mask: dict[str, bool],
+):
+    """Collect features + independent LONG/SHORT profitable-setup binary labels (EV-aware)."""
+    label_cfg = LabelConfig(
+        tp_mult=settings.risk.atr_tp_mult,
+        sl_mult=settings.risk.atr_sl_mult,
+        horizon=_TB_HORIZON,
+    )
+    Fs, y_long, y_short = [], [], []
+    for sym, sd in sym_data.items():
+        n = len(sd.X)
+        start = max(seq_window, _Z_WINDOW)
+        end = n - _TB_HORIZON
+        if end <= start:
+            continue
+        funding = None
+        if "funding_rate" in sd.df.columns:
+            funding = pd.to_numeric(sd.df["funding_rate"], errors="coerce").fillna(0.0).to_numpy(float)
+        labels = ev_aware_directional_labels(
+            sd.df, sd.atr, cfg=label_cfg, vol_scale=sd.vol_scale, funding=funding
+        )
+        tab_p = tab_predictor._calibrator.predict_proba(sd.X[:, tab_predictor._kept_idx])[:, 1]
+        p_cont, trend = _seq_series(seq_module, seq_mean, seq_std, sd.chan_frame, seq_window, seq_device)
+        rl_expo = _rl_series(rl_model, sd.X, sd.atr, sd.prices)
+        for i in range(start, end):
+            Fs.append(
+                build_meta_features(
+                    tab_p[i], p_cont[i], trend[i], rl_expo[i], sd.regime_oh[i], layer_mask=layer_mask
+                )
+            )
+            y_long.append(int(labels[i] == CLASS_LONG))
+            y_short.append(int(labels[i] == CLASS_SHORT))
+        log.info("train.production.side_specialist.symbol", symbol=sym, n=end - start)
+    return (
+        np.asarray(Fs, dtype=np.float32),
+        np.asarray(y_long, dtype=np.int64),
+        np.asarray(y_short, dtype=np.int64),
+    )
+
+
+def _label_counts(y_long: np.ndarray, y_short: np.ndarray) -> dict:
+    n = len(y_long)
+    return {
+        "LONG_profitable": int(y_long.sum()),
+        "SHORT_profitable": int(y_short.sum()),
+        "SKIP": int(n - np.logical_or(y_long, y_short).sum()),
+        "n": int(n),
+    }
+
+
+def _load_mtf_15m_cache() -> dict | None:
+    import os
+
+    path = os.environ.get("AEB_MTF_15M_CACHE_PATH")
+    if not path or not Path(path).exists():
+        return None
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {sym: {k: np.asarray(v, dtype=float) for k, v in feats.items()} for sym, feats in raw.items()}
+
+
+def train_side_specialists(
+    sym_data,
+    settings,
+    tab_predictor,
+    seq_module,
+    seq_mean,
+    seq_std,
+    seq_device,
+    seq_window,
+    rl_model,
+    *,
+    seq_metrics: dict,
+    rl_metrics: dict,
+    side_configs=None,
+    walk_forward: bool = False,
+    apply_regime_at_inference: bool = False,
+    mtf_15m: dict | None = None,
+    balance_side_specialists: bool = False,
+    long_positive_weight: float | str | None = None,
+    short_positive_weight: float | str | None = None,
+    balance_train_samples: bool = False,
+    max_side_train_samples_per_class: int | None = None,
+    sequence_skipped: bool = False,
+):
+    """Train independent LONG/SHORT binary specialists; calibrate on validation only."""
+    import os
+
+    from ae_brain.training.regime_filter import training_regime_from_side_configs
+    from ae_brain.training.side_configs import SideLabelConfig, SideLabelConfigPair, load_side_configs
+    from ae_brain.training.specialist_dataset import collect_specialist_dataset
+    from ae_brain.training.specialist_features import SPECIALIST_FEATURE_NAMES
+    from ae_brain.training.specialist_train import train_specialist_pair
+    from ae_brain.training.walk_forward import run_walk_forward_specialists
+
+    layer_mask = _build_layer_mask(settings, seq_metrics, rl_metrics)
+    (settings.model.artifacts_dir / "meta_layer_mask.json").write_text(
+        json.dumps(layer_mask, indent=2), encoding="utf-8"
+    )
+
+    label_horizon = int(os.environ.get("AEB_LABEL_HORIZON", str(_TB_HORIZON)))
+    min_reward = float(os.environ.get("AEB_LABEL_MIN_NET_REWARD", "1.0"))
+    min_vol_z = float(v) if (v := os.environ.get("AEB_SPECIALIST_MIN_VOL_Z")) else None
+
+    if side_configs is None:
+        side_configs = SideLabelConfigPair(
+            long=SideLabelConfig(
+                tp_mult=settings.risk.atr_tp_mult,
+                sl_mult=settings.risk.atr_sl_mult,
+                horizon=label_horizon,
+                min_net_reward_usd=min_reward,
+                min_vol_z=min_vol_z,
+            ),
+            short=SideLabelConfig(
+                tp_mult=settings.risk.atr_tp_mult,
+                sl_mult=settings.risk.atr_sl_mult,
+                horizon=label_horizon,
+                min_net_reward_usd=min_reward,
+                min_vol_z=min_vol_z,
+            ),
+        )
+    side_configs.save(settings.model.artifacts_dir)
+    training_regime_from_side_configs(side_configs, apply_at_inference=apply_regime_at_inference).save(
+        settings.model.artifacts_dir
+    )
+
+    ds = collect_specialist_dataset(
+        sym_data,
+        settings,
+        tab_predictor,
+        seq_module,
+        seq_mean,
+        seq_std,
+        seq_device,
+        seq_window,
+        rl_model,
+        layer_mask,
+        side_configs=side_configs,
+        min_vol_z=min_vol_z,
+        use_extended_features=True,
+        tb_horizon=label_horizon,
+        mtf_15m=mtf_15m,
+    )
+    cut_train, cut_val = ds.train_val_cuts()
+    model_kind = __import__("os").environ.get("AEB_SPECIALIST_MODEL_KIND", "lightgbm")
+
+    # When balancing is enabled but no explicit weight is given, default to 'auto'
+    # (scale_pos_weight = neg/pos) for each side independently. This upweights the
+    # minority positive (profitable-setup) class without weakening production gates.
+    long_spw_req: float | str | None = long_positive_weight
+    short_spw_req: float | str | None = short_positive_weight
+    if balance_side_specialists:
+        if long_spw_req is None:
+            long_spw_req = "auto"
+        if short_spw_req is None:
+            short_spw_req = "auto"
+
+    rep = train_specialist_pair(
+        ds.F,
+        ds.y_long,
+        ds.y_short,
+        ds.ev_long,
+        ds.ev_short,
+        cut_train=cut_train,
+        cut_val=cut_val,
+        model_kind=model_kind,
+        calibration_method=settings.model.calibration_method,
+        long_scale_pos_weight=long_spw_req if isinstance(long_spw_req, (float, str)) else None,
+        short_scale_pos_weight=short_spw_req if isinstance(short_spw_req, (float, str)) else None,
+        balance_train_samples=balance_train_samples,
+        max_side_train_samples_per_class=max_side_train_samples_per_class,
+        symbols=ds.symbols,
+        regime_ids=ds.regime_ids,
+    )
+    rep["long_model"].save(settings.model.artifacts_dir)
+    rep["short_model"].save(settings.model.artifacts_dir)
+    rep["side_calibrators"].save(settings.model.artifacts_dir)
+
+    label_report = {
+        "all": _label_counts(ds.y_long, ds.y_short),
+        "train": _label_counts(ds.y_long[:cut_train], ds.y_short[:cut_train]),
+        "validation_calibration": _label_counts(ds.y_long[cut_train:cut_val], ds.y_short[cut_train:cut_val]),
+    }
+
+    report = {
+        "meta_mode": "side_specialists",
+        "layer_mask": layer_mask,
+        "feature_names": list(SPECIALIST_FEATURE_NAMES),
+        "side_configs": side_configs.to_dict(),
+        "label_config": side_configs.long.to_dict(),
+        "label_report": label_report,
+        "long_specialist": rep["long_metrics"],
+        "short_specialist": rep["short_metrics"],
+        "calibration": rep["calibration"],
+        "validation_production_metrics": rep["validation_production_metrics"],
+        "confidence_ceiling": rep["confidence_ceiling"],
+        "side_balance": rep.get("side_balance"),
+        "calibration_ceiling_summary": rep.get("calibration_ceiling_summary"),
+        "second_pass_threshold_report": rep.get("second_pass_threshold_report"),
+        "balancing": rep.get("balancing"),
+        "splits": {"n_total": len(ds), "n_train": cut_train, "n_validation": cut_val - cut_train},
+        "no_test_leakage": True,
+        "apply_regime_filter_at_inference": apply_regime_at_inference,
+        "sequence_skipped": sequence_skipped,
+    }
+    if walk_forward:
+        report["walk_forward"] = run_walk_forward_specialists(
+            ds.F,
+            ds.y_long,
+            ds.y_short,
+            ds.ev_long,
+            ds.ev_short,
+            ds.timestamps,
+            label_horizon=side_configs.max_horizon(),
+            model_kind=model_kind,
+            calibration_method=settings.model.calibration_method,
+            symbols=ds.symbols,
+            regime_ids=ds.regime_ids,
+        )
+    (settings.model.artifacts_dir / "side_specialists_report.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8"
+    )
+    return report
+
+
+def train_meta_two_stage(
+    sym_data,
+    settings,
+    tab_predictor,
+    seq_module,
+    seq_mean,
+    seq_std,
+    seq_device,
+    seq_window,
+    rl_model,
+    *,
+    seq_metrics: dict,
+    rl_metrics: dict,
+    meta_mode: str = "two_stage",
+):
+    layer_mask = _build_layer_mask(settings, seq_metrics, rl_metrics)
+    mask_path = settings.model.artifacts_dir / "meta_layer_mask.json"
+    mask_path.write_text(json.dumps(layer_mask, indent=2), encoding="utf-8")
+
+    F, y = _collect_meta_dataset(
+        sym_data,
+        settings,
+        tab_predictor,
+        seq_module,
+        seq_mean,
+        seq_std,
+        seq_device,
+        seq_window,
+        rl_model,
+        layer_mask,
+    )
+    cut = max(1, int(len(F) * 0.8))
+
+    if meta_mode == "legacy_3class":
+        meta = MetaModel(model_kind="logreg")
+        metrics = meta.fit(F, y)
+        meta.save(settings.model.artifacts_dir)
+        calibrator = ConfidenceCalibrator(settings.model.calibration_method)
+        cal_report = _fit_confidence_calibrator_legacy(
+            meta, F[cut:], y[cut:], settings, calibrator
+        )
+    else:
+        meta = TwoStageMetaModel(model_kind="logreg")
+        metrics = meta.fit(F, y)
+        meta.save(settings.model.artifacts_dir)
+        calibrator = ConfidenceCalibrator(settings.model.calibration_method)
+        cal_report = _fit_confidence_calibrator_two_stage(
+            meta, F[cut:], y[cut:], settings, calibrator
+        )
+        calibrator.save(settings.model.artifacts_dir)
+
+    return {
+        **metrics,
+        "layer_mask": layer_mask,
+        "layer_quality": {"sequence": seq_metrics, "rl": rl_metrics},
+        "calibration": cal_report,
+        "meta_mode": meta_mode,
+    }
+
+
+def _fit_confidence_calibrator_two_stage(meta, F_val, y_val, settings, calibrator: ConfidenceCalibrator) -> dict:
+    raw_scores, y_prof = [], []
+    for i in range(len(F_val)):
+        pred = meta.predict(
+            F_val[i],
+            trade_threshold=settings.fusion.meta_trade_threshold,
+            direction_margin=settings.fusion.meta_direction_margin,
+        )
+        if pred.directional_class is None:
+            continue
+        raw = pred.raw_confidence
+        y_true = int(y_val[i])
+        profitable = int(
+            (pred.directional_class == CLASS_LONG and y_true == CLASS_LONG)
+            or (pred.directional_class == CLASS_SHORT and y_true == CLASS_SHORT)
+        )
+        raw_scores.append(raw)
+        y_prof.append(profitable)
+    if raw_scores:
+        report = calibrator.fit(np.asarray(raw_scores), np.asarray(y_prof))
+        return report.to_dict()
+    return {"error": "insufficient_calibration_samples", "n": 0}
+
+
+def _fit_confidence_calibrator_legacy(meta, F_val, y_val, settings, calibrator: ConfidenceCalibrator) -> dict:
+    from ae_brain.layers.meta import resolve_directional_class
+
+    raw_scores, y_prof = [], []
+    for i in range(len(F_val)):
+        pred = meta.predict(F_val[i])
+        directional, _ = resolve_directional_class(
+            pred.p_short,
+            pred.p_long,
+            threshold=settings.fusion.meta_direction_threshold,
+            margin=settings.fusion.meta_direction_margin,
+        )
+        if directional is None:
+            continue
+        raw = pred.p_long if directional == CLASS_LONG else pred.p_short
+        y_true = int(y_val[i])
+        profitable = int(
+            (directional == CLASS_LONG and y_true == CLASS_LONG)
+            or (directional == CLASS_SHORT and y_true == CLASS_SHORT)
+        )
+        raw_scores.append(raw)
+        y_prof.append(profitable)
+    if raw_scores:
+        report = calibrator.fit(np.asarray(raw_scores), np.asarray(y_prof))
+        calibrator.save(settings.model.artifacts_dir)
+        return report.to_dict()
+    return {"error": "insufficient_calibration_samples", "n": 0}
+
+
+def train_side_aware_ensemble(
+    sym_data,
+    settings,
+    tab_predictor,
+    seq_module,
+    seq_mean,
+    seq_std,
+    seq_device,
+    seq_window,
+    rl_model,
+    *,
+    seq_metrics: dict,
+    rl_metrics: dict,
+):
+    """Train two-stage meta, select per-side sources on validation only, fit per-side calibrators."""
+    from ae_brain.layers.side_aware import _raw_confidence_for_source
+
+    layer_mask = _build_layer_mask(settings, seq_metrics, rl_metrics)
+    (settings.model.artifacts_dir / "meta_layer_mask.json").write_text(
+        json.dumps(layer_mask, indent=2), encoding="utf-8"
+    )
+    F, y = _collect_meta_dataset(
+        sym_data, settings, tab_predictor, seq_module, seq_mean, seq_std, seq_device, seq_window, rl_model, layer_mask
+    )
+    n = len(F)
+    cut_train = max(1, int(n * 0.70))
+    cut_val = max(cut_train + 1, int(n * 0.85))
+
+    two_stage = TwoStageMetaModel(model_kind="logreg")
+    two_metrics = two_stage.fit(F, y, train_end=cut_train)
+    two_stage.save(settings.model.artifacts_dir)
+
+    legacy = MetaModel(model_kind="logreg")
+    legacy_metrics = legacy.fit(F, y, train_end=cut_train)
+    legacy.save(settings.model.artifacts_dir)
+
+    F_sel, y_sel = F[cut_train:cut_val], y[cut_train:cut_val]
+    source_scores: dict[str, dict[str, float]] = {}
+    for source in SOURCE_MODES:
+        meta_for_source = two_stage if source == "two_stage_meta" else legacy if source == "legacy_3class_meta" else None
+        source_scores[source] = score_source_on_validation(
+            source,
+            F_val=F_sel,
+            y_val=y_sel,
+            meta_model=meta_for_source,
+            settings=settings,
+            layer_mask=layer_mask,
+        )
+
+    long_src, short_src, long_m, short_m = select_sources_on_validation(source_scores)
+    config = SideAwareConfig(
+        long_source=long_src,
+        short_source=short_src,
+        selection_split="validation_70_85",
+        long_source_metrics=long_m,
+        short_source_metrics=short_m,
+        publish_confidence=0.70,
+    )
+    save_side_aware_config(config, settings.model.artifacts_dir)
+
+    from ae_brain.contracts import LayerProbabilities
+    from ae_brain.layers.side_aware import _ablation_for_source, _fuse_score
+
+    long_raw, long_y, short_raw, short_y = [], [], [], []
+    cfg = settings.fusion
+    for i in range(len(F_sel)):
+        vec = F_sel[i]
+        p_up, p_cont, trend, rl = float(vec[0]), float(vec[1]), float(vec[2]), float(vec[3])
+        reg = vec[4:7]
+        probs = LayerProbabilities(
+            tabular_p_up=p_up,
+            sequence_p_continuation=p_cont,
+            sequence_trend_sign=trend,
+            rl_target_exposure=rl,
+        )
+        fused = _fuse_score(
+            probs,
+            ablation_mode=_ablation_for_source(long_src),
+            layer_mask=layer_mask,
+            w_tab=cfg.w_tabular,
+            w_seq=cfg.w_sequence,
+            w_rl=cfg.w_rl,
+        )
+        meta_pred = None
+        if long_src in ("two_stage_meta", "legacy_3class_meta"):
+            mf = build_meta_features(p_up, p_cont, trend, rl, reg, layer_mask=layer_mask)
+            meta_pred = two_stage.predict(mf, trade_threshold=cfg.meta_trade_threshold, direction_margin=cfg.meta_direction_margin) if long_src == "two_stage_meta" else legacy.predict(mf)
+        raw_l, _ = _raw_confidence_for_source(
+            long_src, "LONG", fused=fused, meta_pred=meta_pred,
+            min_conviction=cfg.min_conviction, trade_threshold=cfg.meta_trade_threshold,
+            direction_margin=cfg.meta_direction_margin, direction_threshold=cfg.meta_direction_threshold,
+        )
+        if short_src in ("two_stage_meta", "legacy_3class_meta"):
+            mf = build_meta_features(p_up, p_cont, trend, rl, reg, layer_mask=layer_mask)
+            meta_pred = two_stage.predict(mf, trade_threshold=cfg.meta_trade_threshold, direction_margin=cfg.meta_direction_margin) if short_src == "two_stage_meta" else legacy.predict(mf)
+        else:
+            meta_pred = None
+        raw_s, _ = _raw_confidence_for_source(
+            short_src, "SHORT", fused=fused, meta_pred=meta_pred,
+            min_conviction=cfg.min_conviction, trade_threshold=cfg.meta_trade_threshold,
+            direction_margin=cfg.meta_direction_margin, direction_threshold=cfg.meta_direction_threshold,
+        )
+        y_i = int(y_sel[i])
+        long_raw.append(raw_l)
+        long_y.append(int(y_i == CLASS_LONG))
+        short_raw.append(raw_s)
+        short_y.append(int(y_i == CLASS_SHORT))
+
+    side_cals = SideCalibrators(settings.model.calibration_method)
+    cal_long = side_cals.long.fit(np.asarray(long_raw), np.asarray(long_y))
+    cal_short = side_cals.short.fit(np.asarray(short_raw), np.asarray(short_y))
+    side_cals.save(settings.model.artifacts_dir)
+
+    return {
+        "meta_mode": "side_aware_ensemble",
+        "two_stage": two_metrics,
+        "legacy": legacy_metrics,
+        "source_scores_validation": source_scores,
+        "selected_sources": {"LONG": long_src, "SHORT": short_src},
+        "layer_mask": layer_mask,
+        "calibration": {"LONG": cal_long.to_dict(), "SHORT": cal_short.to_dict()},
+        "selection_rows": int(len(F_sel)),
+        "no_test_leakage": True,
+    }
+
+
+def train_meta_multi(sym_data, settings, tab_predictor, seq_module, seq_mean, seq_std,
+                     seq_device, seq_window, rl_model, *, seq_metrics=None, rl_metrics=None, meta_mode="two_stage"):
+    if meta_mode == "side_aware_ensemble":
+        return train_side_aware_ensemble(
+            sym_data, settings, tab_predictor, seq_module, seq_mean, seq_std, seq_device, seq_window, rl_model,
+            seq_metrics=seq_metrics or {}, rl_metrics=rl_metrics or {},
+        )
+    if meta_mode == "side_specialists":
+        import os
+        from pathlib import Path as _Path
+
+        from ae_brain.training.side_configs import SideLabelConfigPair
+
+        side_configs = None
+        sc_path = os.environ.get("AEB_SIDE_CONFIGS_PATH")
+        if sc_path and _Path(sc_path).exists():
+            side_configs = SideLabelConfigPair.from_dict(json.loads(_Path(sc_path).read_text(encoding="utf-8")))
+
+        def _envbool(key: str, default: bool = False) -> bool:
+            return os.environ.get(key, "").lower() in ("1", "true", "yes") if os.environ.get(key) else default
+
+        balance_side = _envbool("AEB_BALANCE_SIDE_SPECIALISTS")
+        balance_samples = _envbool("AEB_BALANCE_TRAIN_SAMPLES")
+        allow_skip_seq = _envbool("AEB_ALLOW_SKIP_SEQUENCE")
+
+        long_w_raw = os.environ.get("AEB_LONG_POSITIVE_WEIGHT")
+        short_w_raw = os.environ.get("AEB_SHORT_POSITIVE_WEIGHT")
+
+        def _parse_weight(v: str | None) -> float | str | None:
+            if v is None or v == "":
+                return None
+            if v.strip().lower() == "auto":
+                return "auto"
+            try:
+                return float(v)
+            except ValueError:
+                return None
+
+        max_per = os.environ.get("AEB_MAX_SIDE_TRAIN_SAMPLES_PER_CLASS")
+        max_per_int = int(max_per) if (max_per and max_per.strip().isdigit()) else None
+
+        return train_side_specialists(
+            sym_data, settings, tab_predictor, seq_module, seq_mean, seq_std, seq_device, seq_window, rl_model,
+            seq_metrics=seq_metrics or {}, rl_metrics=rl_metrics or {},
+            side_configs=side_configs,
+            walk_forward=_envbool("AEB_WALK_FORWARD"),
+            apply_regime_at_inference=_envbool("AEB_APPLY_REGIME_FILTER_AT_INFERENCE"),
+            mtf_15m=_load_mtf_15m_cache(),
+            balance_side_specialists=balance_side,
+            long_positive_weight=_parse_weight(long_w_raw),
+            short_positive_weight=_parse_weight(short_w_raw),
+            balance_train_samples=balance_samples,
+            max_side_train_samples_per_class=max_per_int,
+            sequence_skipped=allow_skip_seq and seq_module is None,
+        )
+    return train_meta_two_stage(
+        sym_data,
+        settings,
+        tab_predictor,
+        seq_module,
+        seq_mean,
+        seq_std,
+        seq_device,
+        seq_window,
+        rl_model,
+        seq_metrics=seq_metrics or {},
+        rl_metrics=rl_metrics or {},
+        meta_mode=meta_mode,
+    )
 
 
 # --------------------------------------------------------------------------- #
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the production A.E. Brain ensemble")
     parser.add_argument("--data-dir", type=Path, default=Path("data/production"))
-    parser.add_argument("--symbols", default="BTCUSDT,ETHUSDT,SOLUSDT")
+    parser.add_argument("--symbols", default=default_allowed_symbols_csv())
     parser.add_argument("--interval", default="1h")
     parser.add_argument("--artifacts", type=Path, default=None)
     parser.add_argument("--seq-epochs", type=int, default=4)
     parser.add_argument("--seq-cap", type=int, default=60000)
     parser.add_argument("--seq-batch", type=int, default=256)
     parser.add_argument("--rl-timesteps", type=int, default=150_000)
+    parser.add_argument("--sample-per-symbol", type=int, default=None, help="Use only last N rows per symbol (memory-safe)")
+    parser.add_argument("--meta-mode", choices=["two_stage", "legacy_3class", "side_aware_ensemble", "side_specialists"], default="two_stage")
+    parser.add_argument("--allow-skip-sequence", action="store_true",
+                        help="Memory-safe: if sequence training is too heavy/fails, skip it and "
+                             "continue with tabular + side specialists + regime + calibration.")
     args = parser.parse_args()
 
     settings = Settings()
+    settings.fusion.meta_mode = args.meta_mode
     if args.artifacts is not None:
         settings.model.artifacts_dir = args.artifacts
     settings.model.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    frames = _load_symbol_frames(args.data_dir, symbols, args.interval)
+    frames = _load_symbol_frames(args.data_dir, symbols, args.interval, sample_per_symbol=args.sample_per_symbol)
 
     summary: dict = {"symbols": list(frames), "artifacts_dir": str(settings.model.artifacts_dir)}
     t0 = time.time()
@@ -465,27 +1066,63 @@ def main() -> None:
     print(json.dumps(summary["tabular"], indent=2, default=str), flush=True)
 
     print("\n=== [2/4] Sequence (PatchTST + regime channels) ===", flush=True)
-    seq_metrics, seq_module, seq_mean, seq_std, seq_device, seq_window = train_sequence_multi(
-        sym_data, settings, epochs=args.seq_epochs, cap=args.seq_cap, batch_size=args.seq_batch
-    )
-    summary["sequence"] = seq_metrics
-    print(json.dumps(seq_metrics, indent=2, default=str), flush=True)
+    sequence_skipped = False
+    seq_metrics: dict = {}
+    try:
+        seq_metrics, seq_module, seq_mean, seq_std, seq_device, seq_window = train_sequence_multi(
+            sym_data, settings, epochs=args.seq_epochs, cap=args.seq_cap, batch_size=args.seq_batch
+        )
+    except (RuntimeError, MemoryError, OSError) as exc:
+        if args.allow_skip_sequence:
+            log.warning("train.production.sequence.skipped", err=str(exc), allow_skip=True)
+            print(f"Sequence training failed ({exc}); --allow-skip-sequence set -> skipping.", flush=True)
+            sequence_skipped = True
+            seq_module = None
+            seq_mean = np.zeros(len(SEQ_CHANNELS), dtype=np.float32)
+            seq_std = np.ones(len(SEQ_CHANNELS), dtype=np.float32)
+            seq_device = "cpu"
+            seq_window = settings.model.sequence_window
+            seq_metrics = {"skipped": True, "reason": str(exc), "val_auc": 0.0}
+        else:
+            raise
+    if sequence_skipped:
+        # The sequence layer is masked off downstream; neutral stubs are used for
+        # the sequence column of the meta-feature vector so specialist features
+        # remain dimensionally valid.
+        summary["sequence"] = seq_metrics
+        summary["sequence_skipped"] = True
+        print("Sequence layer SKIPPED. Continuing with tabular + specialists.", flush=True)
+    else:
+        summary["sequence"] = seq_metrics
+        print(json.dumps(seq_metrics, indent=2, default=str), flush=True)
 
     print("\n=== [3/4] RL Risk Agent (PPO) ===", flush=True)
     rl_metrics, rl_model = train_rl_multi(sym_data, settings, total_timesteps=args.rl_timesteps)
     summary["rl"] = rl_metrics
     print(json.dumps(rl_metrics, indent=2, default=str), flush=True)
 
-    print("\n=== [4/4] Meta-model (stacking) ===", flush=True)
-    # Reload the pruned tabular predictor so meta uses the deployed kept features.
+    print("\n=== [4/4] Meta-model (two-stage + calibration) ===", flush=True)
     tab_predictor = TabularPredictor(settings.model)
     tab_predictor.load(settings.model.artifacts_dir)
     summary["meta"] = train_meta_multi(
-        sym_data, settings, tab_predictor, seq_module, seq_mean, seq_std, seq_device, seq_window, rl_model
+        sym_data,
+        settings,
+        tab_predictor,
+        seq_module,
+        seq_mean,
+        seq_std,
+        seq_device,
+        seq_window,
+        rl_model,
+        seq_metrics=seq_metrics,
+        rl_metrics=rl_metrics,
+        meta_mode=args.meta_mode,
     )
     print(json.dumps(summary["meta"], indent=2, default=str), flush=True)
 
     summary["elapsed_sec"] = round(time.time() - t0, 1)
+    summary_path = settings.model.artifacts_dir / "training_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     print("\n=== SUMMARY ===", flush=True)
     print(json.dumps(summary, indent=2, default=str), flush=True)
 
