@@ -1,23 +1,9 @@
-"""Layer 4 - Fusion / Output layer.
-
-Aggregates the calibrated outputs of the three predictive layers into a single,
-strict, deterministic decision. The pipeline is:
-
-1. Convert each layer's output into a directional signal in ``[-1, 1]``.
-2. Weighted-blend into a fused conviction + direction.
-3. Translate calibrated probabilities into first-passage ``prob_tp`` / ``prob_sl``
-   for the chosen side.
-4. Place ATR-based TP/SL and compute fractional-Kelly / vol-targeted size,
-   respecting the correlation budget.
-5. Run the **EV gate**. Publish LONG/SHORT only if EV > 0 *and* conviction and
-   size pass their floors; otherwise SKIP.
-
-Output is a :class:`~ae_brain.contracts.FinalSignal` -> deterministic JSON dict.
-"""
+"""Layer 4 - Fusion / Output layer."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 
@@ -38,8 +24,6 @@ log = get_logger("ae_brain.fusion")
 
 @dataclass(slots=True)
 class FusionContext:
-    """Market context required to turn probabilities into a sized, priced order."""
-
     symbol: str
     entry_price: float
     atr: float
@@ -48,8 +32,16 @@ class FusionContext:
     holding_hours: float = 8.0
     correlated_exposure: float = 0.0
     correlation_id: str = ""
-    # Current market-regime one-hot [trend, chop, highvol] for the meta-model.
     regime_onehot: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    tabular_features: np.ndarray | None = None
+    specialist_extra: dict[str, float] | None = None
+    btc_specialist_ctx: dict[str, float] | None = None
+    vol_z: float | None = None
+    signal_reference_price: float = 0.0
+    execution_price_source: str = ""
+    signal_candle_open_time: str = ""
+    signal_candle_close_time: str = ""
+    execution_time: str = ""
 
 
 class FusionLayer:
@@ -60,45 +52,70 @@ class FusionLayer:
         ev_gate: EVGate,
         sizer: PositionSizer,
         meta_model: object | None = None,
+        *,
+        meta_legacy: object | None = None,
+        meta_two_stage: object | None = None,
+        confidence_calibrator: object | None = None,
+        side_calibrators: object | None = None,
+        side_aware_config: object | None = None,
+        side_specialists: object | None = None,
+        layer_mask: dict[str, bool] | None = None,
+        ablation_mode: str | None = None,
+        force_meta_mode: str | None = None,
+        training_regime: object | None = None,
     ) -> None:
         self._cfg = fusion_cfg
         self._risk = risk_cfg
         self._ev = ev_gate
         self._sizer = sizer
-        # Optional trained meta-classifier. When ready, it is the directional
-        # decision authority (replacing the heuristic conviction+EV gate).
         self._meta = meta_model
+        self._meta_legacy = meta_legacy
+        self._meta_two_stage = meta_two_stage
+        self._calibrator = confidence_calibrator
+        self._side_calibrators = side_calibrators
+        self._side_aware_config = side_aware_config
+        self._side_specialists = side_specialists
+        self._layer_mask = layer_mask or {"tabular": True, "sequence": True, "rl": True}
+        self._ablation_mode = ablation_mode
+        self._force_meta_mode = force_meta_mode
+        self._training_regime = training_regime
+        self._ambiguity_skips = 0
 
-    # ------------------------------------------------------------------ #
+    @property
+    def ambiguity_skips(self) -> int:
+        return self._ambiguity_skips
+
     @staticmethod
     def _directional_signals(p: LayerProbabilities) -> tuple[float, float, float]:
-        """Map each layer to a directional signal in [-1, 1]."""
         tab_dir = 2.0 * p.tabular_p_up - 1.0
-        # Sequence continuation only matters in the direction of the trend sign.
         seq_dir = p.sequence_trend_sign * (2.0 * p.sequence_p_continuation - 1.0)
         rl_dir = float(np.clip(p.rl_target_exposure, -1.0, 1.0))
         return tab_dir, seq_dir, rl_dir
 
+    def _effective_weights(self) -> tuple[float, float, float]:
+        w_tab = self._cfg.w_tabular if self._layer_mask.get("tabular", True) else 0.0
+        w_seq = self._cfg.w_sequence if self._layer_mask.get("sequence", True) else 0.0
+        w_rl = self._cfg.w_rl if self._layer_mask.get("rl", True) else 0.0
+        if self._ablation_mode == "tabular_only":
+            w_seq, w_rl = 0.0, 0.0
+        elif self._ablation_mode == "tabular_sequence":
+            w_rl = 0.0
+        elif self._ablation_mode == "tabular_rl":
+            w_seq = 0.0
+        wsum = max(w_tab + w_seq + w_rl, 1e-9)
+        return w_tab / wsum, w_seq / wsum, w_rl / wsum
+
     def _fuse(self, p: LayerProbabilities) -> tuple[float, float]:
-        """Return (fused_score in [-1,1], conviction in [0,1])."""
+        w_tab, w_seq, w_rl = self._effective_weights()
         tab_dir, seq_dir, rl_dir = self._directional_signals(p)
-        w = self._cfg
-        wsum = w.w_tabular + w.w_sequence + w.w_rl
-        fused = (w.w_tabular * tab_dir + w.w_sequence * seq_dir + w.w_rl * rl_dir) / wsum
+        fused = w_tab * tab_dir + w_seq * seq_dir + w_rl * rl_dir
         fused = float(np.clip(fused, -1.0, 1.0))
         return fused, abs(fused)
 
     @staticmethod
     def _side_probabilities(p: LayerProbabilities, side: Side) -> tuple[float, float]:
-        """Blend calibrated layer probs into first-passage prob_tp / prob_sl.
-
-        For a LONG, prob_tp is driven by P(up) and P(continuation); for a SHORT
-        it is their directional complement. prob_sl is the residual adverse mass
-        (kept < 1-prob_tp so the EV gate sees a proper competing-risk pair).
-        """
         p_up = p.tabular_p_up
         cont = p.sequence_p_continuation
-        # Align sequence continuation prob with the requested side.
         if (p.sequence_trend_sign >= 0 and side == Side.LONG) or (
             p.sequence_trend_sign < 0 and side == Side.SHORT
         ):
@@ -107,18 +124,19 @@ class FusionLayer:
             seq_favor = 1.0 - cont
 
         favor_long = 0.6 * p_up + 0.4 * seq_favor
-        prob_tp = favor_long if side == Side.LONG else 1.0 - favor_long
-        prob_tp = float(np.clip(prob_tp, 0.01, 0.99))
-        # Adverse mass: the rest, minus a "neither/timeout" allowance.
+        if side == Side.LONG:
+            prob_tp = float(np.clip(favor_long, 0.01, 0.99))
+        else:
+            prob_tp = float(np.clip(1.0 - favor_long, 0.01, 0.99))
         prob_sl = float(np.clip((1.0 - prob_tp) * 0.85, 0.01, 0.99))
         return prob_tp, prob_sl
 
-    # ------------------------------------------------------------------ #
     def _predict_meta(self, probs: LayerProbabilities, ctx: FusionContext):
-        """Run the meta-model and return raw class probabilities."""
+        if self._ablation_mode == "no_meta":
+            return None
         if self._meta is None or not getattr(self._meta, "is_ready", lambda: False)():
             return None
-        from ae_brain.layers.meta import build_meta_features
+        from ae_brain.layers.meta import TwoStageMetaModel, build_meta_features
 
         mf = build_meta_features(
             probs.tabular_p_up,
@@ -126,12 +144,18 @@ class FusionLayer:
             probs.sequence_trend_sign,
             probs.rl_target_exposure,
             ctx.regime_onehot,
+            layer_mask=self._layer_mask,
         )
+        if isinstance(self._meta, TwoStageMetaModel):
+            return self._meta.predict(
+                mf,
+                trade_threshold=self._cfg.meta_trade_threshold,
+                direction_margin=self._cfg.meta_direction_margin,
+            )
         return self._meta.predict(mf)
 
     @staticmethod
     def _risk_approves(sizing, ev: EVResult) -> bool:
-        """Sizing + EV must both pass before a threshold-qualified meta trade fires."""
         return (
             sizing.kelly_fraction_raw > 0.0
             and sizing.position_size_pct > 0.0
@@ -139,40 +163,476 @@ class FusionLayer:
             and ev.is_positive_ev
         )
 
-    def decide(self, probs: LayerProbabilities, ctx: FusionContext) -> FinalSignal:
-        """Produce the final decision.
+    def _calibrate_confidence(self, raw: float) -> float:
+        if self._calibrator is not None and getattr(self._calibrator, "is_ready", False):
+            return self._calibrator.calibrate(raw)
+        return float(np.clip(raw, 0.0, 1.0))
 
-        When a trained meta-model is attached it supplies directional confidence
-        via ``meta_direction_threshold``; the risk engine (Kelly + EV) decides
-        go/no-go. Otherwise the legacy conviction + EV gate applies.
-        """
-        from ae_brain.layers.meta import CLASS_LONG, CLASS_SHORT, resolve_directional_class
+    def _calibrate_side_confidence(self, side: str, raw: float, *, source: str | None = None) -> float:
+        if source in ("tabular_only", "no_meta"):
+            return float(np.clip(raw, 0.0, 1.0))
+        if self._side_calibrators is not None and getattr(self._side_calibrators, "is_ready", lambda s: False)(side):
+            return self._side_calibrators.calibrate(side, raw)
+        return self._calibrate_confidence(raw)
+
+    def _active_meta_mode(self) -> str:
+        if self._force_meta_mode:
+            return self._force_meta_mode
+        return self._cfg.meta_mode
+
+    def _side_candidate(self, probs: LayerProbabilities, ctx: FusionContext, side: str, source: str):
+        from ae_brain.layers.meta import MetaModel, TwoStageMetaModel, build_meta_features
+        from ae_brain.layers.side_aware import SideCandidate, _ablation_for_source, _fuse_score, _raw_confidence_for_source
+
+        fused = _fuse_score(
+            probs,
+            ablation_mode=_ablation_for_source(source),
+            layer_mask=self._layer_mask,
+            w_tab=self._cfg.w_tabular,
+            w_seq=self._cfg.w_sequence,
+            w_rl=self._cfg.w_rl,
+        )
+        meta_pred = None
+        meta_model = None
+        if source == "two_stage_meta":
+            meta_model = self._meta_two_stage or (
+                self._meta if isinstance(self._meta, TwoStageMetaModel) else None
+            )
+        elif source == "legacy_3class_meta":
+            meta_model = self._meta_legacy or (self._meta if isinstance(self._meta, MetaModel) else None)
+        if meta_model is not None:
+            mf = build_meta_features(
+                probs.tabular_p_up,
+                probs.sequence_p_continuation,
+                probs.sequence_trend_sign,
+                probs.rl_target_exposure,
+                ctx.regime_onehot,
+                layer_mask=self._layer_mask,
+            )
+            if isinstance(meta_model, TwoStageMetaModel):
+                meta_pred = meta_model.predict(
+                    mf,
+                    trade_threshold=self._cfg.meta_trade_threshold,
+                    direction_margin=self._cfg.meta_direction_margin,
+                )
+            elif isinstance(meta_model, MetaModel):
+                meta_pred = meta_model.predict(mf)
+
+        raw, skip_reason = _raw_confidence_for_source(
+            source,
+            side,
+            fused=fused,
+            meta_pred=meta_pred,
+            min_conviction=self._cfg.min_conviction,
+            trade_threshold=self._cfg.meta_trade_threshold,
+            direction_margin=self._cfg.meta_direction_margin,
+            direction_threshold=self._cfg.meta_direction_threshold,
+        )
+        trade_side = Side.LONG if side == "LONG" else Side.SHORT
+        rr_ratio = self._risk.atr_tp_mult / max(self._risk.atr_sl_mult, 1e-9)
+        prob_tp, prob_sl = self._side_probabilities(probs, trade_side)
+        sizing = self._sizer.size(
+            entry=ctx.entry_price,
+            atr=ctx.atr,
+            side=trade_side,
+            prob_tp=prob_tp,
+            reward_risk_ratio=rr_ratio,
+            correlated_exposure=ctx.correlated_exposure,
+        )
+        ev = self._ev.evaluate(
+            side=trade_side,
+            entry=ctx.entry_price,
+            take_profit=sizing.take_profit,
+            stop_loss=sizing.stop_loss,
+            notional_usd=sizing.notional_usd,
+            prob_tp=prob_tp,
+            prob_sl=prob_sl,
+            funding_rate_8h=ctx.funding_rate_8h,
+            holding_hours=ctx.holding_hours,
+            adv_usd=ctx.adv_usd,
+        )
+        risk_ok = self._risk_approves(sizing, ev)
+        cal = self._calibrate_side_confidence(side, raw, source=source)
+        utility = cal * max(ev.expected_value, 0.0)
+        return SideCandidate(
+            side=side,
+            source=source,
+            raw_confidence=raw,
+            calibrated_confidence=cal,
+            ev_usd=ev.expected_value,
+            utility=utility,
+            fused_score=fused,
+            prob_tp=prob_tp,
+            prob_sl=prob_sl,
+            risk_approved=risk_ok,
+            skip_reason=skip_reason,
+        )
+
+    def _decide_side_aware(self, probs: LayerProbabilities, ctx: FusionContext) -> FinalSignal:
+        from ae_brain.layers.side_aware import SideAwareConfig
+
+        config: SideAwareConfig = self._side_aware_config  # type: ignore[assignment]
+        long_cand = self._side_candidate(probs, ctx, "LONG", config.long_source)
+        short_cand = self._side_candidate(probs, ctx, "SHORT", config.short_source)
+
+        candidates = []
+        for cand in (long_cand, short_cand):
+            if cand.risk_approved and cand.ev_usd > 0 and cand.raw_confidence > 0:
+                candidates.append(cand)
+
+        decision = Decision.SKIP
+        chosen = None
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        elif len(candidates) == 2:
+            margin = self._cfg.meta_direction_margin
+            if abs(candidates[0].utility - candidates[1].utility) < margin * max(
+                candidates[0].utility, candidates[1].utility, 1e-9
+            ):
+                self._ambiguity_skips += 1
+            else:
+                chosen = max(candidates, key=lambda c: c.utility)
+
+        if chosen is not None:
+            decision = Decision.LONG if chosen.side == "LONG" else Decision.SHORT
+
+        # Recompute sizing/ev for chosen side (or heuristic skip path)
+        side = Side.LONG if (chosen and chosen.side == "LONG") else Side.SHORT if chosen else Side.LONG
+        if chosen is None:
+            side = Side.LONG if probs.tabular_p_up >= 0.5 else Side.SHORT
+        rr_ratio = self._risk.atr_tp_mult / max(self._risk.atr_sl_mult, 1e-9)
+        prob_tp, prob_sl = self._side_probabilities(probs, side)
+        sizing = self._sizer.size(
+            entry=ctx.entry_price,
+            atr=ctx.atr,
+            side=side,
+            prob_tp=prob_tp,
+            reward_risk_ratio=rr_ratio,
+            correlated_exposure=ctx.correlated_exposure,
+        )
+        ev = self._ev.evaluate(
+            side=side,
+            entry=ctx.entry_price,
+            take_profit=sizing.take_profit,
+            stop_loss=sizing.stop_loss,
+            notional_usd=sizing.notional_usd,
+            prob_tp=prob_tp,
+            prob_sl=prob_sl,
+            funding_rate_8h=ctx.funding_rate_8h,
+            holding_hours=ctx.holding_hours,
+            adv_usd=ctx.adv_usd,
+        )
+        confidence = chosen.calibrated_confidence if chosen else 0.0
+        components = {
+            "decision_source": "side_aware_ensemble",
+            "side_aware": {
+                "long_source": config.long_source,
+                "short_source": config.short_source,
+                "long_candidate": long_cand.to_dict(),
+                "short_candidate": short_cand.to_dict(),
+                "chosen_side": chosen.side if chosen else None,
+            },
+            "layer_probs": probs.as_dict(),
+            "sizing": {
+                "kelly_fraction_raw": sizing.kelly_fraction_raw,
+                "correlation_scale": sizing.correlation_scale,
+                "notional_usd": sizing.notional_usd,
+                "rejected_reason": sizing.rejected_reason,
+            },
+        }
+        return FinalSignal(
+            symbol=ctx.symbol,
+            decision=decision,
+            position_size_pct=sizing.position_size_pct if decision != Decision.SKIP else 0.0,
+            leverage=sizing.leverage if decision != Decision.SKIP else 0.0,
+            take_profit=round(sizing.take_profit, 8) if decision != Decision.SKIP else 0.0,
+            stop_loss=round(sizing.stop_loss, 8) if decision != Decision.SKIP else 0.0,
+            entry_reference=round(ctx.entry_price, 8),
+            expected_value_usd=ev.expected_value if chosen else 0.0,
+            confidence=round(confidence, 6),
+            correlation_id=ctx.correlation_id,
+            ev=ev.as_dict(),
+            components=components,
+        )
+
+    def _eval_side_specialist(
+        self,
+        probs: LayerProbabilities,
+        ctx: FusionContext,
+        side: str,
+        model: object,
+        *,
+        publish_threshold: float = 0.70,
+    ):
+        from ae_brain.layers.side_specialists import SideSpecialistPrediction
+        from ae_brain.training.specialist_features import build_specialist_features_inference
+
+        n_expected = int(getattr(getattr(model, "_scaler", None), "n_features_in_", 0) or 0)
+        if n_expected > 7 and ctx.tabular_features is not None:
+            mf = build_specialist_features_inference(
+                tab_p_up=probs.tabular_p_up,
+                seq_p_cont=probs.sequence_p_continuation,
+                seq_trend=probs.sequence_trend_sign,
+                rl_expo=probs.rl_target_exposure,
+                regime_oh=np.asarray(ctx.regime_onehot, dtype=float),
+                tabular_row=ctx.tabular_features,
+                symbol=ctx.symbol,
+                extra=ctx.specialist_extra,
+                btc_ctx=ctx.btc_specialist_ctx,
+                layer_mask=self._layer_mask,
+            )
+        else:
+            from ae_brain.layers.meta import build_meta_features
+
+            mf = build_meta_features(
+                probs.tabular_p_up,
+                probs.sequence_p_continuation,
+                probs.sequence_trend_sign,
+                probs.rl_target_exposure,
+                ctx.regime_onehot,
+                layer_mask=self._layer_mask,
+            )
+        raw = float(model.predict_raw(mf)) if getattr(model, "is_ready", lambda: False)() else 0.0
+        cal = self._calibrate_side_confidence(side, raw)
+        trade_side = Side.LONG if side == "LONG" else Side.SHORT
+        rr_ratio = self._risk.atr_tp_mult / max(self._risk.atr_sl_mult, 1e-9)
+        prob_tp, prob_sl = self._side_probabilities(probs, trade_side)
+        sizing = self._sizer.size(
+            entry=ctx.entry_price,
+            atr=ctx.atr,
+            side=trade_side,
+            prob_tp=prob_tp,
+            reward_risk_ratio=rr_ratio,
+            correlated_exposure=ctx.correlated_exposure,
+        )
+        ev = self._ev.evaluate(
+            side=trade_side,
+            entry=ctx.entry_price,
+            take_profit=sizing.take_profit,
+            stop_loss=sizing.stop_loss,
+            notional_usd=sizing.notional_usd,
+            prob_tp=prob_tp,
+            prob_sl=prob_sl,
+            funding_rate_8h=ctx.funding_rate_8h,
+            holding_hours=ctx.holding_hours,
+            adv_usd=ctx.adv_usd,
+        )
+        sizing_ok = sizing.position_size_pct > 0.0 and sizing.rejected_reason is None
+        ev_ok = ev.is_positive_ev
+        conf_ok = cal >= publish_threshold
+        skip_reason = None
+        if not conf_ok:
+            skip_reason = "below_publish_threshold"
+        elif not ev_ok:
+            skip_reason = "non_positive_ev"
+        elif not sizing_ok:
+            skip_reason = sizing.rejected_reason or "zero_sizing"
+        pred = SideSpecialistPrediction(
+            side=side,
+            p_profitable_raw=raw,
+            p_profitable_calibrated=cal,
+            ev_usd=ev.expected_value,
+            confidence_adjusted_ev=cal * max(ev.expected_value, 0.0),
+            prob_tp=prob_tp,
+            prob_sl=prob_sl,
+            sizing_ok=sizing_ok,
+            publishable=conf_ok and ev_ok and sizing_ok,
+            skip_reason=skip_reason,
+        )
+        return pred, sizing, ev
+
+    def _regime_filter_skip(self, ctx: FusionContext) -> FinalSignal | None:
+        regime = self._training_regime
+        if regime is None or not getattr(regime, "apply_at_inference", False):
+            return None
+        vol_z = ctx.vol_z
+        if vol_z is None:
+            return None
+        reason = regime.skip_reason_for(vol_z)
+        if reason is None:
+            return None
+        from ae_brain.training.regime_filter import regime_filter_skip_signal_components
+
+        return FinalSignal(
+            symbol=ctx.symbol,
+            decision=Decision.SKIP,
+            position_size_pct=0.0,
+            leverage=0.0,
+            take_profit=0.0,
+            stop_loss=0.0,
+            entry_reference=round(ctx.entry_price, 8),
+            expected_value_usd=0.0,
+            confidence=0.0,
+            correlation_id=ctx.correlation_id,
+            components=regime_filter_skip_signal_components(reason, vol_z),
+        )
+
+    def _decide_side_specialists(self, probs: LayerProbabilities, ctx: FusionContext) -> FinalSignal:
+        filtered = self._regime_filter_skip(ctx)
+        if filtered is not None:
+            return filtered
+
+        bundle = self._side_specialists
+        publish_thr = 0.70
+        if bundle is None or not getattr(bundle, "is_ready", lambda: False)():
+            return FinalSignal(
+                symbol=ctx.symbol,
+                decision=Decision.SKIP,
+                position_size_pct=0.0,
+                leverage=0.0,
+                take_profit=0.0,
+                stop_loss=0.0,
+                entry_reference=round(ctx.entry_price, 8),
+                expected_value_usd=0.0,
+                confidence=0.0,
+                correlation_id=ctx.correlation_id,
+                components={"decision_source": "side_specialists", "error": "specialists_not_ready"},
+            )
+
+        long_pred, long_sizing, long_ev = self._eval_side_specialist(
+            probs, ctx, "LONG", bundle.long_model, publish_threshold=publish_thr
+        )
+        short_pred, short_sizing, short_ev = self._eval_side_specialist(
+            probs, ctx, "SHORT", bundle.short_model, publish_threshold=publish_thr
+        )
+
+        decision = Decision.SKIP
+        chosen = None
+        sizing = long_sizing
+        ev = long_ev
+        confidence = 0.0
+
+        long_valid = long_pred.publishable
+        short_valid = short_pred.publishable
+
+        if long_valid and not short_valid:
+            decision, chosen = Decision.LONG, long_pred
+            sizing, ev = long_sizing, long_ev
+        elif short_valid and not long_valid:
+            decision, chosen = Decision.SHORT, short_pred
+            sizing, ev = short_sizing, short_ev
+        elif long_valid and short_valid:
+            margin = self._cfg.meta_direction_margin
+            u_l, u_s = long_pred.confidence_adjusted_ev, short_pred.confidence_adjusted_ev
+            if abs(u_l - u_s) < margin * max(u_l, u_s, 1e-9):
+                self._ambiguity_skips += 1
+            elif u_l > u_s:
+                decision, chosen = Decision.LONG, long_pred
+                sizing, ev = long_sizing, long_ev
+            else:
+                decision, chosen = Decision.SHORT, short_pred
+                sizing, ev = short_sizing, short_ev
+
+        if chosen is not None:
+            confidence = chosen.p_profitable_calibrated
+
+        components = {
+            "decision_source": "side_specialists",
+            "side_specialists": {
+                "long": {
+                    "p_long_profitable_raw": round(long_pred.p_profitable_raw, 6),
+                    "p_long_profitable_calibrated": round(long_pred.p_profitable_calibrated, 6),
+                    "ev_long": round(long_pred.ev_usd, 4),
+                    **long_pred.to_dict(),
+                },
+                "short": {
+                    "p_short_profitable_raw": round(short_pred.p_profitable_raw, 6),
+                    "p_short_profitable_calibrated": round(short_pred.p_profitable_calibrated, 6),
+                    "ev_short": round(short_pred.ev_usd, 4),
+                    **short_pred.to_dict(),
+                },
+                "chosen_side": chosen.side if chosen else None,
+            },
+            "layer_probs": probs.as_dict(),
+            "sizing": {
+                "kelly_fraction_raw": sizing.kelly_fraction_raw,
+                "correlation_scale": sizing.correlation_scale,
+                "notional_usd": sizing.notional_usd,
+                "rejected_reason": sizing.rejected_reason,
+            },
+        }
+        return FinalSignal(
+            symbol=ctx.symbol,
+            decision=decision,
+            position_size_pct=sizing.position_size_pct if decision != Decision.SKIP else 0.0,
+            leverage=sizing.leverage if decision != Decision.SKIP else 0.0,
+            take_profit=round(sizing.take_profit, 8) if decision != Decision.SKIP else 0.0,
+            stop_loss=round(sizing.stop_loss, 8) if decision != Decision.SKIP else 0.0,
+            entry_reference=round(ctx.entry_price, 8),
+            expected_value_usd=ev.expected_value if chosen else 0.0,
+            confidence=round(confidence, 6),
+            correlation_id=ctx.correlation_id,
+            ev=ev.as_dict() if chosen else {},
+            components=components,
+        )
+
+    def decide(self, probs: LayerProbabilities, ctx: FusionContext) -> FinalSignal:
+        filtered = self._regime_filter_skip(ctx)
+        if filtered is not None:
+            return filtered
+        if self._active_meta_mode() == "side_specialists" and self._side_specialists is not None:
+            return self._decide_side_specialists(probs, ctx)
+        if self._active_meta_mode() == "side_aware_ensemble" and self._side_aware_config is not None:
+            return self._decide_side_aware(probs, ctx)
+
+        from ae_brain.layers.meta import (
+            CLASS_LONG,
+            CLASS_SHORT,
+            MetaPrediction,
+            TwoStageMetaModel,
+            TwoStagePrediction,
+            resolve_directional_class,
+        )
 
         fused, conviction = self._fuse(probs)
         heuristic_side = Side.LONG if fused >= 0 else Side.SHORT
         threshold = self._cfg.meta_direction_threshold
+        margin = self._cfg.meta_direction_margin
 
         meta_pred = self._predict_meta(probs, ctx)
-        directional_class = None
-        if meta_pred is not None:
-            directional_class = resolve_directional_class(
+        directional_class: int | None = None
+        meta_skip_reason: str | None = None
+        raw_confidence = conviction
+        side = heuristic_side
+        decision_source = "heuristic_ev_gate"
+
+        if isinstance(meta_pred, TwoStagePrediction):
+            decision_source = "meta_two_stage"
+            directional_class = meta_pred.directional_class
+            meta_skip_reason = meta_pred.skip_reason
+            if directional_class == CLASS_LONG:
+                side = Side.LONG
+                raw_confidence = meta_pred.p_trade * meta_pred.p_long_given_trade
+            elif directional_class == CLASS_SHORT:
+                side = Side.SHORT
+                raw_confidence = meta_pred.p_trade * meta_pred.p_short_given_trade
+            else:
+                side = heuristic_side
+                raw_confidence = meta_pred.p_trade
+            if meta_skip_reason == "directional_ambiguity":
+                self._ambiguity_skips += 1
+        elif isinstance(meta_pred, MetaPrediction):
+            decision_source = "meta_legacy_3class"
+            directional_class, meta_skip_reason = resolve_directional_class(
                 meta_pred.p_short,
                 meta_pred.p_long,
                 threshold=threshold,
+                margin=margin,
             )
+            if meta_skip_reason == "directional_ambiguity":
+                self._ambiguity_skips += 1
             if directional_class == CLASS_LONG:
                 side = Side.LONG
-                conviction = meta_pred.p_long
+                raw_confidence = meta_pred.p_long
             elif directional_class == CLASS_SHORT:
                 side = Side.SHORT
-                conviction = meta_pred.p_short
+                raw_confidence = meta_pred.p_short
             else:
                 side = heuristic_side
-                conviction = meta_pred.p_skip
-        else:
+                raw_confidence = meta_pred.p_skip
+        elif meta_pred is not None:
             side = heuristic_side
 
-        # Reward:risk ratio implied by ATR multiples.
         rr_ratio = self._risk.atr_tp_mult / max(self._risk.atr_sl_mult, 1e-9)
         prob_tp, prob_sl = self._side_probabilities(probs, side)
 
@@ -206,27 +666,45 @@ class FusionLayer:
         else:
             decision = self._gate_decision(side, conviction, sizing, ev)
 
+        calibrated_confidence = self._calibrate_confidence(raw_confidence) if decision != Decision.SKIP else self._calibrate_confidence(raw_confidence)
+
+        meta_components: dict[str, Any] | None = None
+        if isinstance(meta_pred, TwoStagePrediction):
+            meta_components = {
+                "mode": "two_stage",
+                "p_trade": round(meta_pred.p_trade, 6),
+                "p_long_given_trade": round(meta_pred.p_long_given_trade, 6),
+                "p_short_given_trade": round(meta_pred.p_short_given_trade, 6),
+                "trade_threshold": round(self._cfg.meta_trade_threshold, 4),
+                "direction_margin": round(margin, 4),
+                "directional_class": directional_class,
+                "skip_reason": meta_skip_reason,
+                "raw_confidence": round(raw_confidence, 6),
+                "calibrated_confidence": round(calibrated_confidence, 6),
+            }
+        elif isinstance(meta_pred, MetaPrediction):
+            meta_components = {
+                "mode": "legacy_3class",
+                "p_short": round(meta_pred.p_short, 6),
+                "p_skip": round(meta_pred.p_skip, 6),
+                "p_long": round(meta_pred.p_long, 6),
+                "direction_threshold": round(threshold, 4),
+                "direction_margin": round(margin, 4),
+                "directional_class": directional_class,
+                "skip_reason": meta_skip_reason,
+                "raw_confidence": round(raw_confidence, 6),
+                "calibrated_confidence": round(calibrated_confidence, 6),
+            }
+
         components = {
             "fused_score": round(fused, 6),
-            "directional": dict(
-                zip(("tabular", "sequence", "rl"), self._directional_signals(probs))
-            ),
+            "directional": dict(zip(("tabular", "sequence", "rl"), self._directional_signals(probs))),
             "layer_probs": probs.as_dict(),
             "regime_onehot": list(ctx.regime_onehot),
-            "decision_source": "meta_model" if meta_pred is not None else "heuristic_ev_gate",
-            "meta": (
-                {
-                    "p_short": round(meta_pred.p_short, 6),
-                    "p_skip": round(meta_pred.p_skip, 6),
-                    "p_long": round(meta_pred.p_long, 6),
-                    "direction_threshold": round(threshold, 4),
-                    "directional_class": directional_class,
-                    "long_passes_threshold": meta_pred.p_long > threshold,
-                    "short_passes_threshold": meta_pred.p_short > threshold,
-                }
-                if meta_pred is not None
-                else None
-            ),
+            "decision_source": decision_source,
+            "layer_mask": dict(self._layer_mask),
+            "ablation_mode": self._ablation_mode,
+            "meta": meta_components,
             "sizing": {
                 "kelly_fraction_raw": sizing.kelly_fraction_raw,
                 "correlation_scale": sizing.correlation_scale,
@@ -235,24 +713,6 @@ class FusionLayer:
                 "reward_risk_ratio": round(rr_ratio, 4),
             },
         }
-
-        log.info(
-            "fusion.decision_debug",
-            symbol=ctx.symbol,
-            decision=str(decision),
-            p_short=round(meta_pred.p_short, 6) if meta_pred else None,
-            p_skip=round(meta_pred.p_skip, 6) if meta_pred else None,
-            p_long=round(meta_pred.p_long, 6) if meta_pred else None,
-            meta_direction_threshold=threshold,
-            directional_class=directional_class,
-            kelly_fraction=sizing.kelly_fraction_raw,
-            position_size_pct=sizing.position_size_pct,
-            ev_usd=ev.expected_value,
-            is_positive_ev=ev.is_positive_ev,
-            risk_approves=self._risk_approves(sizing, ev),
-            sizing_rejected=sizing.rejected_reason,
-            decision_source=components["decision_source"],
-        )
 
         return FinalSignal(
             symbol=ctx.symbol,
@@ -263,20 +723,13 @@ class FusionLayer:
             stop_loss=round(sizing.stop_loss, 8) if decision != Decision.SKIP else 0.0,
             entry_reference=round(ctx.entry_price, 8),
             expected_value_usd=ev.expected_value,
-            confidence=round(conviction, 6),
+            confidence=round(calibrated_confidence if decision != Decision.SKIP else raw_confidence, 6),
             correlation_id=ctx.correlation_id,
             ev=ev.as_dict(),
             components=components,
         )
 
-    def _gate_decision(
-        self,
-        side: Side,
-        conviction: float,
-        sizing,
-        ev: EVResult,
-    ) -> Decision:
-        """Apply the strict gates in priority order."""
+    def _gate_decision(self, side: Side, conviction: float, sizing, ev: EVResult) -> Decision:
         if conviction < self._cfg.min_conviction:
             return Decision.SKIP
         if sizing.position_size_pct <= 0.0 or sizing.rejected_reason:

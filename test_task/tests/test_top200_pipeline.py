@@ -303,6 +303,40 @@ def test_downloader_resume_does_not_redownload_existing_complete_files(tmp_path:
     assert "BTCUSDT" in state["downloaded_symbols"]
 
 
+def test_warn_publishable_sides_logs_without_raising(tmp_path: Path) -> None:
+    run_top200 = _load_script("run_top200_training")
+    logger = run_top200.setup_logger(tmp_path / "train.log")
+    warnings = run_top200.warn_publishable_sides(
+        {"publishable_long_count_ge_70": 0, "publishable_short_count_ge_70": 100},
+        logger=logger,
+    )
+    assert len(warnings) == 1
+    assert "LONG" in warnings[0]
+
+
+def test_side_specialists_diagnostic_snapshot(tmp_path: Path) -> None:
+    run_top200 = _load_script("run_top200_training")
+    artifact_dir = tmp_path / "candidate"
+    artifact_dir.mkdir()
+    (artifact_dir / "side_specialists_report.json").write_text(
+        json.dumps(
+            {
+                "second_pass_threshold_report": {
+                    "per_threshold": {"0.70": {"publishable_LONG": 1, "publishable_SHORT": 2}}
+                },
+                "calibration_ceiling_summary": {"LONG": {}},
+                "side_balance": {"label_counts": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    snap = run_top200._side_specialists_diagnostic_snapshot(artifact_dir)
+    assert snap is not None
+    assert snap["diagnostic_only"] is True
+    assert snap["promotion_source_of_truth"] == "summary.json"
+    assert snap["second_pass_threshold_0_70"]["publishable_LONG"] == 1
+
+
 def test_write_universe_files_roundtrip(tmp_path: Path) -> None:
     ex = _fake_exchange_info()
     record = build_top200_universe(ex, _fake_tickers(ex), target_size=200)

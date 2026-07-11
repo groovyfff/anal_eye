@@ -167,6 +167,20 @@ def normalize_candidate(
             "direction_hint": direction_hint,
         }
     )
+    for key in (
+        "signal_candle_open_time",
+        "candle_open_time",
+        "signal_candle_close_time",
+        "candle_close_time",
+        "execution_time",
+        "execution_price",
+        "execution_price_source",
+        "next_candle_open",
+        "next_candle_open_time",
+        "mark_price",
+    ):
+        if payload.get(key) is not None:
+            meta[key] = payload[key]
 
     normalized = {
         "symbol": str(symbol),

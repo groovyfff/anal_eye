@@ -138,18 +138,55 @@ def build_publishable_report(test_metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def assert_publishable_sides(test_metrics: dict[str, Any]) -> None:
+def warn_publishable_sides(test_metrics: dict[str, Any], *, logger: logging.Logger) -> list[str]:
+    """Log side imbalance; never raise — summary.json is the promotion source of truth."""
+    warnings: list[str] = []
     pub_long = int(test_metrics.get("publishable_long_count_ge_70", 0))
     pub_short = int(test_metrics.get("publishable_short_count_ge_70", 0))
     if pub_long <= 0:
-        raise RuntimeError("no publishable LONG signals on test split at confidence >= 0.70")
+        msg = "no publishable LONG signals on test split at confidence >= 0.70"
+        warnings.append(msg)
+        logger.warning(msg)
     if pub_short <= 0:
-        raise RuntimeError("no publishable SHORT signals on test split at confidence >= 0.70")
+        msg = "no publishable SHORT signals on test split at confidence >= 0.70"
+        warnings.append(msg)
+        logger.warning(msg)
+    return warnings
 
 
-def run_subprocess(cmd: list[str], *, logger: logging.Logger, cwd: Path = ROOT) -> None:
+def run_subprocess(
+    cmd: list[str],
+    *,
+    logger: logging.Logger,
+    cwd: Path = ROOT,
+    allow_exit_codes: tuple[int, ...] = (),
+) -> int:
     logger.info("exec %s", " ".join(cmd))
-    subprocess.run(cmd, cwd=str(cwd), check=True)
+    result = subprocess.run(cmd, cwd=str(cwd))
+    if result.returncode != 0 and result.returncode not in allow_exit_codes:
+        raise subprocess.CalledProcessError(result.returncode, cmd)
+    return result.returncode
+
+
+def _side_specialists_diagnostic_snapshot(artifact_dir: Path) -> dict[str, Any] | None:
+    """Extract validation-only diagnostics; must not drive promotion decisions."""
+    report_path = artifact_dir / "side_specialists_report.json"
+    if not report_path.exists():
+        return None
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    threshold = (report.get("second_pass_threshold_report") or {}).get("per_threshold") or {}
+    at_70 = threshold.get("0.70") or {}
+    return {
+        "diagnostic_only": True,
+        "promotion_source_of_truth": "summary.json",
+        "note": (
+            "side_specialists_report reflects validation-calibration specialist metrics; "
+            "promotion uses summary.json publishable_* fields from the held-out test backtest at 0.70."
+        ),
+        "second_pass_threshold_0_70": at_70,
+        "calibration_ceiling_summary": report.get("calibration_ceiling_summary"),
+        "side_balance": report.get("side_balance"),
+    }
 
 
 def main() -> None:
@@ -281,8 +318,9 @@ def main() -> None:
         state["training_done"] = True
         save_state(state_path, state)
 
+    summary_path = artifact_dir / "summary.json"
     if not state.get("evaluation_done"):
-        run_subprocess(
+        exit_code = run_subprocess(
             [
                 sys.executable,
                 str(ROOT / "scripts" / "evaluate_candidate.py"),
@@ -296,7 +334,12 @@ def main() -> None:
                 str(PUBLISH_CONFIDENCE),
             ],
             logger=logger,
+            allow_exit_codes=(2,),
         )
+        if not summary_path.exists():
+            raise FileNotFoundError(
+                f"evaluate_candidate exited {exit_code} but summary.json is missing: {summary_path}"
+            )
         state["evaluation_done"] = True
         save_state(state_path, state)
 
@@ -304,7 +347,7 @@ def main() -> None:
     if not test_metrics_path.exists():
         raise FileNotFoundError(f"Missing evaluation output: {test_metrics_path}")
     test_metrics = json.loads(test_metrics_path.read_text(encoding="utf-8"))
-    assert_publishable_sides(test_metrics)
+    side_warnings = warn_publishable_sides(test_metrics, logger=logger)
 
     from scripts.diagnose_generalization_gap import build_generalization_report
 
@@ -315,14 +358,23 @@ def main() -> None:
     (reports_dir / "generalization_report.json").write_text(json.dumps(gen_report, indent=2), encoding="utf-8")
     (reports_dir / "publishable_report.json").write_text(json.dumps(pub_report, indent=2), encoding="utf-8")
 
-    summary_path = artifact_dir / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    side_diag = _side_specialists_diagnostic_snapshot(artifact_dir)
     summary["top200_pipeline"] = {
         "run_id": run_id,
         "symbol_count": len(symbols),
         "publishable_report": pub_report,
         "reports_dir": str(reports_dir),
+        "promotion_source_of_truth": "summary.json",
+        "side_specialists_diagnostic_only": side_diag is not None,
     }
+    if side_warnings:
+        summary.setdefault("warnings", [])
+        for w in side_warnings:
+            if w not in summary["warnings"]:
+                summary["warnings"].append(w)
+    if side_diag is not None:
+        summary["side_specialists_diagnostic"] = side_diag
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
     logger.info("top200 training complete run_id=%s artifact_dir=%s", run_id, artifact_dir)

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
-from ae_brain.contracts import Decision, FinalSignal
+from ae_brain.config import AmqpInputConfig, AmqpOutputConfig
+from ae_brain.contracts import Decision, FinalSignal, TradeCandidate
+from ae_brain.messaging.publish_gate import evaluate_publish
 from ae_brain.messaging.rabbitmq import SignalBroker, build_signal_final_payload
+from ae_brain.symbols import DEFAULT_SYMBOL_UNIVERSE
 from ae_brain.messaging.skip_reason import extract_skip_reason
 
 
@@ -32,8 +35,6 @@ def test_extract_skip_reason_from_components() -> None:
 
 
 def test_build_signal_final_payload_includes_skip_fields() -> None:
-    from ae_brain.contracts import TradeCandidate
-
     signal = _skip_signal("SOLUSDT")
     candidate = TradeCandidate(
         symbol="SOLUSDT",
@@ -49,22 +50,25 @@ def test_build_signal_final_payload_includes_skip_fields() -> None:
 
 
 def test_should_publish_signal_respects_flag() -> None:
-    from ae_brain.config import AmqpInputConfig, AmqpOutputConfig
-
     broker = SignalBroker(
         AmqpInputConfig(),
         AmqpOutputConfig(),
         publish_skipped_decisions=False,
+        allowed_symbols=frozenset({"BTCUSDT"}),
+        min_publish_confidence=0.70,
     )
-    from ae_brain.contracts import TradeCandidate
-
-    signal = _skip_signal()
-    candidate = TradeCandidate(symbol="ETHUSDT", interval="1h", candles=[], signal_log_db_id=0)
-    assert broker._should_publish_signal(signal, candidate) is False
+    signal = _skip_signal("BTCUSDT")
+    candidate = TradeCandidate(symbol="BTCUSDT", interval="1h", candles=[], signal_log_db_id=0)
+    should_publish, reason, _ = broker._should_publish_signal(signal, candidate)
+    assert should_publish is False
+    assert reason == "skip_decision"
 
     broker_on = SignalBroker(
         AmqpInputConfig(),
         AmqpOutputConfig(),
         publish_skipped_decisions=True,
+        allowed_symbols=frozenset({"BTCUSDT"}),
+        min_publish_confidence=0.0,
     )
-    assert broker_on._should_publish_signal(signal, candidate) is True
+    should_publish, _, _ = broker_on._should_publish_signal(signal, candidate)
+    assert should_publish is True

@@ -678,6 +678,12 @@ def train_side_specialists(
     }
 
     report = {
+        "diagnostic_only": True,
+        "promotion_source_of_truth": "summary.json",
+        "note": (
+            "Validation-calibration specialist metrics only. Promotion and sweeps must use "
+            "summary.json publishable_* fields from the held-out test backtest at 0.70."
+        ),
         "meta_mode": "side_specialists",
         "layer_mask": layer_mask,
         "feature_names": list(SPECIALIST_FEATURE_NAMES),

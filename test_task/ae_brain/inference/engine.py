@@ -17,6 +17,7 @@ work to executors:
 from __future__ import annotations
 
 import asyncio
+import json
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
@@ -27,10 +28,15 @@ import pandas as pd
 from ae_brain.config import Settings
 from ae_brain.contracts import FinalSignal, LayerProbabilities, TradeCandidate
 from ae_brain.data.database import Database
+from ae_brain.execution.timing import resolve_execution_timing
 from ae_brain.features.engineering import FeatureEngineer
 from ae_brain.features.schema import FEATURE_NAMES, REGIME_ONEHOT_NAMES, n_features
 from ae_brain.layers.fusion import FusionContext, FusionLayer
-from ae_brain.layers.meta import MetaModel
+from ae_brain.layers.meta import MetaModel, TwoStageMetaModel, load_meta_model
+from ae_brain.layers.side_aware import load_side_aware_config
+from ae_brain.layers.side_specialists import load_side_specialists
+from ae_brain.training.calibration import ConfidenceCalibrator, SideCalibrators
+from ae_brain.training.regime_filter import TrainingRegimeConfig, load_training_regime
 from ae_brain.layers.risk_agent import RiskAgent
 from ae_brain.layers.sequence import SequencePredictor
 from ae_brain.layers.tabular import TabularPredictor
@@ -97,20 +103,49 @@ def _engineer_latest(
     frame = eng.compute_frame(df)
     latest = frame.iloc[-1]
 
-    entry_price = _last_float(df, "close", 0.0)
-    atr = float(latest.get("atr_14", 0.0)) or (entry_price * 0.005)
+    signal_reference_price = _last_float(df, "close", 0.0)
+    atr = float(latest.get("atr_14", 0.0)) or (signal_reference_price * 0.005)
     is_derivative = str(asset_class).lower() == "crypto"
     funding_rate = _last_float(df, "funding_rate", 0.0) if is_derivative else 0.0
 
     regime_rows = frame[list(REGIME_ONEHOT_NAMES)].to_numpy(dtype=float)
     regime_onehot = regime_rows[-1].tolist() if len(regime_rows) else [0.0, 0.0, 0.0]
+
+    from ae_brain.training.specialist_features import augment_symbol_frame
+
+    prices = df["close"].to_numpy(dtype=float)
+    high = df["high"].to_numpy(dtype=float)
+    low = df["low"].to_numpy(dtype=float)
+    atr_arr = frame["atr_14"].to_numpy(dtype=float)
+    feat_arr = frame.to_numpy(dtype=float)
+    extra_arrays = augment_symbol_frame(feat_arr, prices, atr_arr, high, low)
+    specialist_extra = {k: float(v[-1]) for k, v in extra_arrays.items()}
+    if "mark_close" in df.columns and "index_close" in df.columns:
+        mark = pd.to_numeric(df["mark_close"], errors="coerce").iloc[-1]
+        index = pd.to_numeric(df["index_close"], errors="coerce").iloc[-1]
+        if index and not pd.isna(index):
+            specialist_extra["basis_pct"] = float((mark - index) / index) if not pd.isna(mark) else 0.0
+
+    btc_specialist_ctx: dict[str, float] = {}
+    sym = str(df.get("symbol", pd.Series([""])).iloc[-1]) if "symbol" in df.columns else ""
+    if sym == "BTCUSDT":
+        btc_specialist_ctx = {
+            "btc_ret_15": float(latest.get("ret_15", 0.0)),
+            "btc_vol_z": float(latest.get("vol_z", 0.0)),
+            "btc_regime_trend": float(regime_onehot[0]) if regime_onehot else 0.0,
+        }
+
     return {
         "features": latest.to_numpy(dtype=np.float32),
-        "entry_price": entry_price,
+        "signal_reference_price": signal_reference_price,
+        "entry_price": signal_reference_price,
         "atr": atr,
         "funding_rate": funding_rate,
+        "vol_z": float(latest.get("vol_z", 0.0)),
         "regime_onehot": regime_onehot,
         "regime_rows": regime_rows.tolist(),
+        "specialist_extra": specialist_extra,
+        "btc_specialist_ctx": btc_specialist_ctx,
     }
 
 
@@ -124,9 +159,36 @@ class InferenceEngine:
         self._sizer = PositionSizer(settings.risk)
         # Meta-model is the directional authority when trained/loaded; the
         # fusion layer falls back to the heuristic EV gate otherwise.
-        self._meta = MetaModel() if settings.model.use_meta_model else None
+        self._meta = load_meta_model(settings.model.artifacts_dir, prefer_two_stage=settings.model.meta_prefer_two_stage) if settings.model.use_meta_model else None
+        self._meta_legacy = MetaModel().load(settings.model.artifacts_dir)
+        self._meta_two_stage = TwoStageMetaModel().load(settings.model.artifacts_dir)
+        if not self._meta_legacy.is_ready():
+            self._meta_legacy = None
+        if not self._meta_two_stage.is_ready():
+            self._meta_two_stage = None
+        self._calibrator = ConfidenceCalibrator(settings.model.calibration_method)
+        self._side_calibrators = SideCalibrators(settings.model.calibration_method)
+        self._side_aware_config = load_side_aware_config(settings.model.artifacts_dir)
+        self._side_specialists = load_side_specialists(settings.model.artifacts_dir)
+        layer_mask = {"tabular": True, "sequence": True, "rl": True}
+        mask_path = Path(settings.model.artifacts_dir) / "meta_layer_mask.json"
+        if mask_path.exists():
+            layer_mask = json.loads(mask_path.read_text(encoding="utf-8"))
+        training_regime = load_training_regime(Path(settings.model.artifacts_dir))
         self._fusion = FusionLayer(
-            settings.fusion, settings.risk, self._ev_gate, self._sizer, meta_model=self._meta
+            settings.fusion,
+            settings.risk,
+            self._ev_gate,
+            self._sizer,
+            meta_model=self._meta,
+            meta_legacy=self._meta_legacy,
+            meta_two_stage=self._meta_two_stage,
+            confidence_calibrator=self._calibrator,
+            side_calibrators=self._side_calibrators,
+            side_aware_config=self._side_aware_config,
+            side_specialists=self._side_specialists,
+            layer_mask=layer_mask,
+            training_regime=training_regime,
         )
 
         self._tabular = TabularPredictor(settings.model)
@@ -148,8 +210,29 @@ class InferenceEngine:
         self._sequence.load(artifacts)
         self._rl.load(artifacts)
         if self._meta is not None:
-            self._meta.load(artifacts)
-        # Warm the per-process regime cache so the first inference is not slow.
+            self._meta = load_meta_model(artifacts, prefer_two_stage=self._s.model.meta_prefer_two_stage)
+        self._meta_legacy = MetaModel().load(artifacts)
+        self._meta_two_stage = TwoStageMetaModel().load(artifacts)
+        if not self._meta_legacy.is_ready():
+            self._meta_legacy = None
+        if not self._meta_two_stage.is_ready():
+            self._meta_two_stage = None
+        self._calibrator.load(artifacts)
+        self._side_calibrators.load(artifacts)
+        self._side_aware_config = load_side_aware_config(artifacts)
+        self._side_specialists = load_side_specialists(artifacts)
+        mask_path = Path(artifacts) / "meta_layer_mask.json"
+        if mask_path.exists():
+            self._fusion._layer_mask = json.loads(mask_path.read_text(encoding="utf-8"))
+        self._fusion._meta = self._meta
+        self._fusion._meta_legacy = self._meta_legacy
+        self._fusion._meta_two_stage = self._meta_two_stage
+        self._fusion._calibrator = self._calibrator
+        self._fusion._side_calibrators = self._side_calibrators
+        self._fusion._side_aware_config = self._side_aware_config
+        self._fusion._side_specialists = self._side_specialists
+        self._fusion._training_regime = load_training_regime(Path(artifacts))
+        # Warm the per-process regime cache
         regime = _get_regime_model(str(artifacts)) if self._s.model.regime_enabled else None
         log.info(
             "engine.models.loaded",
@@ -226,9 +309,15 @@ class InferenceEngine:
         # 3) Correlation context (portfolio risk constraint).
         correlated_exposure = await self._correlated_exposure(candidate.symbol)
 
+        timing = resolve_execution_timing(
+            candidate.candles,
+            candidate.meta,
+            slippage_bps=self._s.cost.base_slippage_bps,
+        )
+
         fusion_ctx = FusionContext(
             symbol=candidate.symbol,
-            entry_price=ctx_data["entry_price"],
+            entry_price=timing.execution_price,
             atr=ctx_data["atr"],
             funding_rate_8h=ctx_data["funding_rate"],
             adv_usd=candidate.meta.get("adv_usd"),
@@ -236,6 +325,15 @@ class InferenceEngine:
             correlated_exposure=correlated_exposure,
             correlation_id=candidate.correlation_id,
             regime_onehot=tuple(ctx_data.get("regime_onehot", (0.0, 0.0, 0.0))),
+            tabular_features=features,
+            specialist_extra=ctx_data.get("specialist_extra"),
+            btc_specialist_ctx=candidate.meta.get("btc_specialist_ctx") or ctx_data.get("btc_specialist_ctx"),
+            vol_z=ctx_data.get("vol_z"),
+            signal_reference_price=timing.signal_reference_price,
+            execution_price_source=timing.execution_price_source,
+            signal_candle_open_time=timing.signal_candle_open_time,
+            signal_candle_close_time=timing.signal_candle_close_time,
+            execution_time=timing.execution_time,
         )
 
         # 4) Fuse + EV gate -> deterministic decision.
@@ -246,6 +344,15 @@ class InferenceEngine:
         signal.signal_id = candidate.signal_id or candidate.correlation_id
         signal.asset_class = candidate.asset_class
         signal.signal_log_db_id = candidate.signal_log_db_id
+        signal.entry_reference = timing.execution_price
+        signal.execution_price = timing.execution_price
+        signal.signal_reference_price = timing.signal_reference_price
+        signal.signal_candle_open_time = timing.signal_candle_open_time
+        signal.signal_candle_close_time = timing.signal_candle_close_time
+        signal.execution_time = timing.execution_time
+        signal.execution_price_source = timing.execution_price_source
+        signal.components = dict(signal.components or {})
+        signal.components["execution_timing"] = timing.to_dict()
 
         # 5) Best-effort audit log (never block the decision on logging failure).
         await self._log_signal(candidate, features, probs, signal)
@@ -254,7 +361,7 @@ class InferenceEngine:
     # ------------------------------------------------------------------ #
     def _build_rl_obs(self, features: np.ndarray, ctx_data: dict, candidate: TradeCandidate) -> np.ndarray:
         """Recreate the env observation: features + [pos, equity-1, atr_pct, corr]."""
-        atr_pct = ctx_data["atr"] / ctx_data["entry_price"] if ctx_data["entry_price"] > 0 else 0.0
+        atr_pct = ctx_data["atr"] / ctx_data["signal_reference_price"] if ctx_data["signal_reference_price"] > 0 else 0.0
         position = float(candidate.meta.get("current_position", 0.0))
         corr = float(candidate.meta.get("correlated_exposure", 0.0))
         extra = np.array([position, 0.0, atr_pct, corr], dtype=np.float32)

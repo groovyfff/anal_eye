@@ -104,12 +104,12 @@ def test_correlation_limit_blocks():
 
 
 def test_meta_threshold_directional_resolution():
-    """Directional class ignores p_skip; threshold + tie-break on p_long/p_short."""
-    # Log case: p_skip=36.4% wins argmax but p_long=33.6% clears 30% floor.
-    assert resolve_directional_class(0.299, 0.336, threshold=0.30) == CLASS_LONG
-    assert resolve_directional_class(0.25, 0.28, threshold=0.30) is None
-    assert resolve_directional_class(0.35, 0.40, threshold=0.30) == CLASS_LONG
-    assert resolve_directional_class(0.40, 0.35, threshold=0.30) == CLASS_SHORT
+    """Directional class ignores p_skip; threshold + argmax tie-break on p_long/p_short."""
+    assert resolve_directional_class(0.299, 0.336, threshold=0.30)[0] == CLASS_LONG
+    assert resolve_directional_class(0.25, 0.28, threshold=0.30)[0] is None
+    assert resolve_directional_class(0.35, 0.40, threshold=0.30)[0] == CLASS_LONG
+    assert resolve_directional_class(0.40, 0.35, threshold=0.30)[0] == CLASS_SHORT
+    assert resolve_directional_class(0.36, 0.37, threshold=0.30, margin=0.05)[0] is None
 
 
 def test_fusion_skip_on_low_conviction():

@@ -1,0 +1,18 @@
+# Default multi-asset training/inference universe for AE Brain.
+#
+# Provenance: commit 6d606390 ("9 coins were added") introduced dynamic
+# multi-symbol support. The only explicit symbol list in that commit is in
+# test_task/tests/test_dynamic_symbols.py (base-asset parametrize):
+#   BTCUSDT, ETHUSDT, SOLUSDT, BNBUSDT, XRPUSDT, DOGEUSDT
+#
+# Git history does not contain a literal nine-symbol constant. This file is
+# the single source of truth for the restored pre-BTC-only default universe.
+# Extend via env (AEB_ALLOWED_SYMBOLS) or CLI (--symbols) for 200+ symbols.
+
+default_universe:
+  - BTCUSDT
+  - ETHUSDT
+  - SOLUSDT
+  - BNBUSDT
+  - XRPUSDT
+  - DOGEUSDT

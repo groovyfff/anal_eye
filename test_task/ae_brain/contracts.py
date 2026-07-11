@@ -189,10 +189,16 @@ class FinalSignal:
     leverage: float
     take_profit: float  # absolute price
     stop_loss: float  # absolute price
-    entry_reference: float  # reference/mark price used for sizing
+    entry_reference: float  # actual execution/fill price (not signal-candle close)
     expected_value_usd: float
     confidence: float  # fused directional conviction in [0, 1]
     correlation_id: str = ""
+    signal_candle_open_time: str = ""
+    signal_candle_close_time: str = ""
+    execution_time: str = ""
+    execution_price_source: str = ""
+    execution_price: float = 0.0
+    signal_reference_price: float = 0.0
     # Identity / routing context propagated from the candidate so the published
     # ``signal.final`` message satisfies the tracker-service contract.
     signal_id: str = ""
@@ -220,6 +226,12 @@ class FinalSignal:
         d["tp"] = self.take_profit
         d["sl"] = self.stop_loss
         d["entry_price"] = self.entry_reference
+        d["execution_price"] = self.execution_price or self.entry_reference
+        d["signal_reference_price"] = self.signal_reference_price
+        d["signal_candle_open_time"] = self.signal_candle_open_time
+        d["signal_candle_close_time"] = self.signal_candle_close_time
+        d["execution_time"] = self.execution_time
+        d["execution_price_source"] = self.execution_price_source
         d["signal_type"] = self.decision.value
         d["reason_summary"] = (
             f"AE Brain {self.components.get('decision_source', 'fusion')}: "

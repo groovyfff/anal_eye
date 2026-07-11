@@ -15,6 +15,12 @@ from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _default_allowed_symbols_csv() -> str:
+    from ae_brain.symbols import default_allowed_symbols_csv
+
+    return default_allowed_symbols_csv()
+
+
 class DatabaseConfig(BaseSettings):
     """Async PostgreSQL connection settings."""
 
@@ -208,7 +214,8 @@ class ModelConfig(BaseSettings):
     # Unsupervised market-regime detector (GaussianMixture) + meta stacker.
     n_regimes: int = 3
     regime_enabled: bool = True
-    use_meta_model: bool = True  # meta-classifier replaces the heuristic EV gate
+    use_meta_model: bool = True
+    meta_prefer_two_stage: bool = True
 
     @field_validator("sequence_window")
     @classmethod
@@ -230,9 +237,14 @@ class FusionConfig(BaseSettings):
     min_conviction: float = 0.55
     # Minimum positive EV (USD) below which we SKIP even if EV>0 (noise floor).
     min_ev_usd: float = 0.0
-    # Meta-model: minimum P(LONG) or P(SHORT) to consider a directional trade.
-    # SKIP probability is not argmax-competed — risk gates decide the final go/no-go.
+    # Meta-model thresholds (two-stage + legacy).
     meta_direction_threshold: float = 0.30
+    meta_trade_threshold: float = 0.45
+    meta_direction_margin: float = 0.05
+    meta_mode: Literal["two_stage", "legacy_3class", "side_aware_ensemble", "side_specialists"] = "two_stage"
+    # Downweight / mask weak base layers in meta features.
+    min_sequence_val_auc: float = 0.52
+    min_rl_mean_reward: float = 0.0
 
 
 class Settings(BaseSettings):
@@ -261,12 +273,68 @@ class Settings(BaseSettings):
     fusion: FusionConfig = Field(default_factory=FusionConfig)
 
     enable_chromadb_rag: bool = False
+    # News sentiment features consumed from RabbitMQ (data.news.sentiment).
+    # Echo-only: attaches the latest fresh snapshot to candidate.meta; does not
+    # yet change trade decisions (see messaging/news_features.py + DECISIONS.md).
+    enable_news_features: bool = False
+    news_features_amqp_url: str = Field(default="", validation_alias="AEB_NEWS_AMQP_URL")
+    news_features_queue: str = Field(
+        default="q_data_news_sentiment", validation_alias="AEB_NEWS_FEATURES_QUEUE"
+    )
+    news_features_routing_key: str = Field(
+        default="data.news.sentiment", validation_alias="AEB_NEWS_FEATURES_ROUTING_KEY"
+    )
+    news_features_exchange: str = Field(
+        default="analeyes.events", validation_alias="AEB_NEWS_FEATURES_EXCHANGE"
+    )
+    news_features_max_age_s: float = Field(
+        default=300.0, validation_alias="AEB_NEWS_FEATURES_MAX_AGE_S"
+    )
+    # --- Optional news.market_signal fusion (OpenRouter path) ----------------
+    # Consumes per-item news market signals (score 1-10) and applies a BOUNDED
+    # confidence/EV nudge. Disabled-by-default-capable but on by default; it is
+    # a pure no-op when the queue is empty or the broker is unreachable.
+    news_signal_enabled: bool = Field(default=True, validation_alias="AEB_NEWS_SIGNAL_ENABLED")
+    news_signal_exchange: str = Field(
+        default="analeyes.events", validation_alias="AEB_NEWS_SIGNAL_EXCHANGE"
+    )
+    news_signal_queue: str = Field(
+        default="q_news_market_signal", validation_alias="AEB_NEWS_SIGNAL_QUEUE"
+    )
+    news_signal_routing_key: str = Field(
+        default="news.market_signal", validation_alias="AEB_NEWS_SIGNAL_ROUTING_KEY"
+    )
+    news_signal_ttl_sec: float = Field(
+        default=21600.0, validation_alias="AEB_NEWS_SIGNAL_TTL_SEC"
+    )
+    news_max_conf_delta: float = Field(
+        default=0.05, validation_alias="AEB_NEWS_MAX_CONF_DELTA"
+    )
+    news_max_ev_multiplier_delta: float = Field(
+        default=0.10, validation_alias="AEB_NEWS_MAX_EV_MULTIPLIER_DELTA"
+    )
+    news_min_relevance: float = Field(
+        default=0.65, validation_alias="AEB_NEWS_MIN_RELEVANCE"
+    )
+    news_signal_amqp_url: str = Field(default="", validation_alias="AEB_NEWS_SIGNAL_AMQP_URL")
     publish_skipped_decisions: bool = Field(
         default=False, validation_alias="AEB_PUBLISH_SKIPPED_DECISIONS"
     )
     disable_signal_dedup_in_test_mode: bool = Field(
         default=False, validation_alias="AEB_DISABLE_SIGNAL_DEDUP_IN_TEST_MODE"
     )
+    allowed_symbols: str = Field(
+        default_factory=_default_allowed_symbols_csv,
+        validation_alias="AEB_ALLOWED_SYMBOLS",
+    )
+    min_publish_confidence: float = Field(default=0.70, validation_alias="AEB_MIN_PUBLISH_CONFIDENCE")
+    only_btc: bool = Field(default=False, validation_alias="AEB_ONLY_BTC")
+
+    @property
+    def allowed_symbol_set(self) -> frozenset[str]:
+        from ae_brain.messaging.publish_gate import parse_allowed_symbols
+
+        return parse_allowed_symbols(self.allowed_symbols, only_btc=self.only_btc)
 
     @model_validator(mode="after")
     def _resolve_amqp_urls(self) -> "Settings":
@@ -278,6 +346,20 @@ class Settings(BaseSettings):
             self.amqp_input = self.amqp_input.model_copy(update={"amqp_url": input_url})
         if output_url != self.amqp_output.amqp_url:
             self.amqp_output = self.amqp_output.model_copy(update={"amqp_url": output_url})
+        return self
+
+    @model_validator(mode="after")
+    def _forbid_unsafe_production_flags(self) -> "Settings":
+        if self.env in ("prod", "staging"):
+            if self.publish_skipped_decisions:
+                raise ValueError(
+                    "AEB_PUBLISH_SKIPPED_DECISIONS=true is forbidden when AEB_ENV is prod/staging"
+                )
+            if self.telegram_debug.enabled:
+                raise ValueError(
+                    "AEB_DIRECT_TELEGRAM_ENABLED=true is forbidden when AEB_ENV is prod/staging "
+                    "(Telegram must consume only signal.final)"
+                )
         return self
 
 

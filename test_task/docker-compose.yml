@@ -123,8 +123,21 @@ services:
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
       AEB_WAIT_FOR_DEPS: "true"
       AEB_AUTO_INIT_DB: "true"
+      AEB_MIN_PUBLISH_CONFIDENCE: "${AEB_MIN_PUBLISH_CONFIDENCE:-0.70}"
+      AEB_ALLOWED_SYMBOLS: "${AEB_ALLOWED_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT}"
+      AEB_ONLY_BTC: "${AEB_ONLY_BTC:-false}"
       AEB_PUBLISH_SKIPPED_DECISIONS: ${AEB_PUBLISH_SKIPPED_DECISIONS:-false}
       AEB_DISABLE_SIGNAL_DEDUP_IN_TEST_MODE: ${AEB_DISABLE_SIGNAL_DEDUP_IN_TEST_MODE:-false}
+      # Optional news.market_signal fusion (OpenRouter path). Bounded, fail-closed:
+      # a no-op when the queue is empty / broker is down. Never breaks inference.
+      AEB_NEWS_SIGNAL_ENABLED: ${AEB_NEWS_SIGNAL_ENABLED:-true}
+      AEB_NEWS_SIGNAL_EXCHANGE: ${AEB_NEWS_SIGNAL_EXCHANGE:-analeyes.events}
+      AEB_NEWS_SIGNAL_QUEUE: ${AEB_NEWS_SIGNAL_QUEUE:-q_news_market_signal}
+      AEB_NEWS_SIGNAL_ROUTING_KEY: ${AEB_NEWS_SIGNAL_ROUTING_KEY:-news.market_signal}
+      AEB_NEWS_SIGNAL_TTL_SEC: ${AEB_NEWS_SIGNAL_TTL_SEC:-21600}
+      AEB_NEWS_MAX_CONF_DELTA: ${AEB_NEWS_MAX_CONF_DELTA:-0.05}
+      AEB_NEWS_MAX_EV_MULTIPLIER_DELTA: ${AEB_NEWS_MAX_EV_MULTIPLIER_DELTA:-0.10}
+      AEB_NEWS_MIN_RELEVANCE: ${AEB_NEWS_MIN_RELEVANCE:-0.65}
     volumes:
       - ./artifacts:/app/artifacts
       - ./data:/app/data

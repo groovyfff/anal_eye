@@ -19,6 +19,13 @@ from ae_brain.config import AmqpInputConfig, AmqpOutputConfig, TelegramDebugConf
 from ae_brain.contracts import Decision, FinalSignal, TradeCandidate
 from ae_brain.messaging.amqp_utils import assert_analeyes_amqp, log_endpoint, parse_amqp_url
 from ae_brain.messaging.candidate_normalizer import normalize_candidate
+from ae_brain.messaging.publish_gate import (
+    default_allowed_symbol_set,
+    evaluate_publish,
+    is_symbol_allowed,
+    normalize_candidate_symbol,
+    normalize_confidence,
+)
 from ae_brain.messaging.skip_reason import extract_skip_reason
 from ae_brain.utils.logging import get_logger
 
@@ -39,6 +46,9 @@ def _build_reason_summary(signal: FinalSignal) -> str:
 
 def build_signal_final_payload(signal: FinalSignal, candidate: TradeCandidate) -> dict:
     payload = signal.to_dict()
+    normalized_confidence = normalize_confidence(signal.confidence)
+    if normalized_confidence is not None:
+        payload["confidence"] = normalized_confidence
     payload["source_ai"] = "ae_brain"
     payload["signal_type"] = signal.decision.value
     payload["reason_summary"] = _build_reason_summary(signal)
@@ -51,6 +61,18 @@ def build_signal_final_payload(signal: FinalSignal, candidate: TradeCandidate) -
     payload["candles"] = candidate.candles
     if candidate.meta.get("composite_score") is not None:
         payload["composite_score"] = candidate.meta["composite_score"]
+    timing = (signal.components or {}).get("execution_timing") or {}
+    for key in (
+        "signal_candle_open_time",
+        "signal_candle_close_time",
+        "execution_time",
+        "execution_price_source",
+        "execution_price",
+        "signal_reference_price",
+    ):
+        value = getattr(signal, key, None) or timing.get(key)
+        if value not in (None, "", 0.0):
+            payload[key] = value
     return payload
 
 
@@ -66,6 +88,9 @@ class SignalBroker:
         telegram_cfg: TelegramDebugConfig | None = None,
         publish_skipped_decisions: bool = False,
         disable_signal_dedup_in_test_mode: bool = False,
+        allowed_symbols: frozenset[str] | None = None,
+        min_publish_confidence: float = 0.70,
+        only_btc: bool = False,
     ) -> None:
         self._input_cfg = input_cfg
         self._output_cfg = output_cfg
@@ -75,6 +100,9 @@ class SignalBroker:
         self._telegram_cfg = telegram_cfg or TelegramDebugConfig()
         self._publish_skipped_decisions = publish_skipped_decisions
         self._disable_signal_dedup = disable_signal_dedup_in_test_mode
+        self._allowed_symbols = allowed_symbols or default_allowed_symbol_set()
+        self._min_publish_confidence = min_publish_confidence
+        self._only_btc = only_btc
         self._input_connection = None
         self._output_connection = None
         self._input_channel = None
@@ -142,6 +170,7 @@ class SignalBroker:
             "AEBrain published signal.final",
             symbol=signal.symbol,
             decision=signal.decision.value,
+            confidence=normalize_confidence(signal.confidence),
             source_ai="ae_brain",
             exchange=self._output_cfg.exchange,
             routing_key=self._output_cfg.routing_key,
@@ -150,7 +179,10 @@ class SignalBroker:
             event="signal_final_published",
         )
 
-    def _should_publish_signal(self, signal: FinalSignal, candidate: TradeCandidate) -> bool:
+    def _allowed_symbols_label(self) -> str:
+        return ",".join(sorted(self._allowed_symbols))
+
+    def _should_publish_signal(self, signal: FinalSignal, candidate: TradeCandidate) -> tuple[bool, str | None, float | None]:
         if self._disable_signal_dedup:
             log.info(
                 "signal_dedup_bypassed",
@@ -158,9 +190,16 @@ class SignalBroker:
                 decision=signal.decision.value,
                 reason="AEB_DISABLE_SIGNAL_DEDUP_IN_TEST_MODE",
             )
-        if signal.decision != Decision.SKIP:
-            return True
-        return self._publish_skipped_decisions
+        should_publish, reason, normalized_confidence = evaluate_publish(
+            signal,
+            allowed_symbols=self._allowed_symbols,
+            min_confidence=self._min_publish_confidence,
+        )
+        if should_publish:
+            return True, None, normalized_confidence
+        if reason == "skip_decision" and self._publish_skipped_decisions:
+            return True, None, normalized_confidence
+        return False, reason, normalized_confidence
 
     async def consume(self, handler: SignalHandler) -> None:
         import aio_pika
@@ -201,8 +240,10 @@ class SignalBroker:
                     return
 
                 top_keys = list(payload.keys()) if isinstance(payload, dict) else []
+                raw_symbol = str(payload.get("symbol", "")).strip() if isinstance(payload, dict) else ""
                 log.info(
                     "AEBrain received candidate",
+                    symbol=raw_symbol,
                     delivery_tag=message.delivery_tag,
                     exchange=message.exchange,
                     routing_key=message.routing_key,
@@ -216,10 +257,29 @@ class SignalBroker:
                 normalized_summary = norm.summary
                 if norm.skip_reason:
                     log.info(
-                        "AEBrain SKIP candidate",
+                        "AEBrain skipped candidate",
                         symbol=symbol or "",
                         reason=norm.skip_reason,
                         normalized=normalized_summary,
+                        ack="skipped_and_acked",
+                    )
+                    await message.ack()
+                    acked = True
+                    return
+
+                if norm.payload is not None:
+                    normalized_symbol = normalize_candidate_symbol(norm.payload.get("symbol"), only_btc=self._only_btc)
+                    if normalized_symbol:
+                        norm.payload["symbol"] = normalized_symbol
+                        symbol = normalized_symbol
+
+                if not symbol or not is_symbol_allowed(symbol, self._allowed_symbols):
+                    allowed = self._allowed_symbols_label()
+                    log.info(
+                        "candidate_rejected_symbol",
+                        symbol=symbol or raw_symbol or "",
+                        reason="unsupported_symbol",
+                        allowed=allowed,
                         ack="skipped_and_acked",
                     )
                     await message.ack()
@@ -241,20 +301,10 @@ class SignalBroker:
                 candidate = TradeCandidate.from_message(norm.payload or {})
                 features = candidate.meta.get("features") or {}
                 log.info(
-                    "candidate_received",
-                    symbol=candidate.symbol,
-                    asset_class=candidate.asset_class,
-                    candles_count=len(candidate.candles),
-                )
-                log.info(
                     "AEBrain normalized candidate",
                     symbol=candidate.symbol,
-                    asset_class=candidate.asset_class,
-                    price=candidate.meta.get("current_price"),
-                    composite=candidate.meta.get("composite_score"),
-                    features_count=len(features),
                     candles_count=len(candidate.candles),
-                    direction_hint=norm.direction_hint,
+                    features_count=len(features),
                 )
 
                 log.info("AEBrain running analysis", symbol=candidate.symbol)
@@ -285,30 +335,63 @@ class SignalBroker:
                     return
 
                 log.info(
-                    "decision_created",
-                    symbol=signal.symbol,
-                    decision=signal.decision.value,
-                    confidence=signal.confidence,
-                )
-                log.info(
                     "AEBrain result",
                     symbol=signal.symbol,
                     decision=signal.decision.value,
-                    confidence=signal.confidence,
-                    reason=_build_reason_summary(signal)[:120],
+                    confidence=normalize_confidence(signal.confidence),
                 )
 
-                if not self._should_publish_signal(signal, candidate):
-                    log.info(
-                        "AEBrain decided SKIP",
-                        symbol=signal.symbol,
-                        reason=_build_reason_summary(signal),
-                        publish_skipped_decisions=self._publish_skipped_decisions,
-                    )
+                should_publish, suppress_reason, normalized_confidence = self._should_publish_signal(signal, candidate)
+                if not should_publish:
+                    if suppress_reason == "unsupported_symbol":
+                        log.info(
+                            "AEBrain skipped candidate",
+                            symbol=signal.symbol,
+                            reason="unsupported_symbol",
+                            allowed=self._allowed_symbols_label(),
+                            ack="skipped_and_acked",
+                        )
+                    elif suppress_reason == "confidence_below_threshold":
+                        log.info(
+                            "AEBrain suppressed signal",
+                            symbol=signal.symbol,
+                            decision=signal.decision.value,
+                            confidence=normalized_confidence,
+                            min_confidence=self._min_publish_confidence,
+                            reason="confidence_below_threshold",
+                        )
+                    elif suppress_reason in {"skip_decision", "empty_decision"}:
+                        log.info(
+                            "AEBrain suppressed signal",
+                            symbol=signal.symbol,
+                            decision=signal.decision.value,
+                            confidence=normalized_confidence,
+                            reason=suppress_reason,
+                        )
+                    elif suppress_reason in {"negative_ev", "invalid_sizing"}:
+                        log.info(
+                            "AEBrain suppressed signal",
+                            symbol=signal.symbol,
+                            decision=signal.decision.value,
+                            confidence=normalized_confidence,
+                            expected_value_usd=signal.expected_value_usd,
+                            reason=suppress_reason,
+                        )
+                    else:
+                        log.info(
+                            "AEBrain suppressed signal",
+                            symbol=signal.symbol,
+                            decision=signal.decision.value,
+                            confidence=normalized_confidence,
+                            reason=suppress_reason or "not_publishable",
+                        )
                     await message.ack()
                     acked = True
                     log.info("skipped_and_acked", symbol=signal.symbol)
                     return
+
+                if normalized_confidence is not None:
+                    signal.confidence = normalized_confidence
 
                 if signal.decision == Decision.SKIP and self._publish_skipped_decisions:
                     log.info(
@@ -336,7 +419,19 @@ class SignalBroker:
                 if self._telegram_cfg.enabled:
                     from ae_brain.messaging.telegram_debug import send_debug_telegram
 
-                    await send_debug_telegram(self._telegram_cfg, build_signal_final_payload(signal, candidate))
+                    should_debug, debug_reason, _ = evaluate_publish(
+                        signal,
+                        allowed_symbols=self._allowed_symbols,
+                        min_confidence=self._min_publish_confidence,
+                    )
+                    if should_debug:
+                        await send_debug_telegram(self._telegram_cfg, build_signal_final_payload(signal, candidate))
+                    else:
+                        log.info(
+                            "telegram_debug_suppressed",
+                            symbol=signal.symbol,
+                            reason=debug_reason,
+                        )
 
                 await message.ack()
                 acked = True

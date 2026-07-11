@@ -119,3 +119,24 @@ Each layer is independently trainable, swappable, and observable.
   is optional, off by default, and never in the decision path.
 * **`numpy < 2.0`.** Required for TA-Lib 0.4.28 ABI compatibility; pinned
   everywhere.
+
+## 6. News sentiment features — RabbitMQ-only, echo-only
+
+* **Boundary contract.** AE Brain receives news sentiment **strictly through
+  RabbitMQ** (`data.news.sentiment` / `q_data_news_sentiment`), published by the
+  separate `news-sentiment-service`. There are no direct imports, calls, or
+  shared memory between the two services. `messaging/news_features.py` is the
+  sole integration point and is fully isolated (its own aio-pika connection,
+  channel, and queue).
+* **Echo-only by design (for now).** AE Brain re-derives all scoring features
+  from candles, so the latest fresh news snapshot is attached to
+  `candidate.meta["news"]` (and mirrored under `candidate.meta["features"]` with
+  `news_` prefixes) for **logging/echo only**. It does NOT yet change trade
+  decisions. Wiring news into `FusionContext` (mirroring `btc_specialist_ctx`)
+  is the documented next step.
+* **Graceful degradation.** The consumer is gated behind
+  `enable_news_features` (default `false`), so existing deployments are
+  unaffected. Snapshots expire after `news_features_max_age_s` (default 300s);
+  when no fresh snapshot exists for a symbol, the candidate is untouched and
+  scoring proceeds normally. Invalid payloads are ACKed (no poison loop).
+
