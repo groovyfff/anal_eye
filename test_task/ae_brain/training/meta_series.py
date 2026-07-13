@@ -47,6 +47,8 @@ def seq_series(module, mean, std, chan_frame, window, device):
 
 def rl_series(model, X, atr, prices):
     n = len(X)
+    if model is None:
+        return np.zeros(n, dtype=float)
     atr_pct = np.divide(atr, prices, out=np.zeros(n), where=prices > 0)
     extra = np.column_stack([np.zeros(n), np.zeros(n), atr_pct, np.zeros(n)]).astype(np.float32)
     obs = np.concatenate([X.astype(np.float32), extra], axis=1)

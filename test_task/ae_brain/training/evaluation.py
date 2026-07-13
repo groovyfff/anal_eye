@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -433,6 +435,41 @@ def evaluate_meta_predictions(
         if directional_mask.any()
         else {"n": 0},
     }
+
+
+def side_specialist_collapse_warnings(
+    artifacts_dir: Path,
+    summary: dict[str, Any],
+    *,
+    publish_confidence: float = 0.70,
+) -> list[str]:
+    """Warn when validation diagnostics show both sides but final summary is one-sided."""
+    report_path = artifacts_dir / "side_specialists_report.json"
+    if not report_path.exists():
+        return []
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    threshold = (report.get("second_pass_threshold_report") or {}).get("per_threshold") or {}
+    at_thr = threshold.get(f"{publish_confidence:.2f}") or {}
+    diag_long = int(at_thr.get("publishable_LONG", 0))
+    diag_short = int(at_thr.get("publishable_SHORT", 0))
+    if diag_long <= 0 or diag_short <= 0:
+        return []
+
+    pub_long = int(summary.get("publishable_long_count_ge_70", 0))
+    pub_short = int(summary.get("publishable_short_count_ge_70", 0))
+    warnings: list[str] = []
+    if pub_long > 0 and pub_short == 0:
+        warnings.append(
+            "side_specialists_validation_both_sides_but_final_summary_long_only_collapse"
+        )
+    elif pub_short > 0 and pub_long == 0:
+        warnings.append(
+            "side_specialists_validation_both_sides_but_final_summary_short_only_collapse"
+        )
+    return warnings
 
 
 def build_summary_json(

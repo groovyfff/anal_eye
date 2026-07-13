@@ -156,6 +156,25 @@ class CandidateResult:
     imbalance_penalty: float = 0.0
 
 
+def infer_training_failure_reason(artifact_dir: Path) -> list[str]:
+    """Best-effort diagnostics when summary.json is missing after training."""
+    reasons: list[str] = []
+    log_path = artifact_dir / "logs" / "train.log"
+    if log_path.exists():
+        text = log_path.read_text(encoding="utf-8", errors="ignore")
+        if any(token in text for token in ("SIGKILL", "Signals.SIGKILL", "signal 9", "Killed")):
+            reasons.append("training_sigkill")
+    state_path = artifact_dir / "state.json"
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            state = {}
+        if state.get("training_done") and not summary_path_for(artifact_dir).exists():
+            reasons.append("training_done_but_summary_missing")
+    return reasons
+
+
 def evaluate_candidate_result(
     *,
     run_id: str,
@@ -178,6 +197,7 @@ def evaluate_candidate_result(
     summary = parse_summary_json(summary_path)
     if summary is None:
         result.rejection_reasons.append("summary_json_missing")
+        result.rejection_reasons.extend(infer_training_failure_reason(artifact_dir))
         return result
 
     result.summary = summary
@@ -250,6 +270,8 @@ def build_training_command(
     sample_per_symbol: int,
     batch_size: int,
     resume: bool,
+    skip_sequence: bool = True,
+    skip_rl: bool = True,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -272,6 +294,10 @@ def build_training_command(
         "true",
         "--allow-skip-sequence",
         "true",
+        "--skip-sequence",
+        "true" if skip_sequence else "false",
+        "--skip-rl",
+        "true" if skip_rl else "false",
         "--long-positive-weight",
         format_weight(long_weight),
         "--short-positive-weight",
@@ -307,6 +333,8 @@ def run_candidate_training(
     sample_per_symbol: int,
     batch_size: int,
     resume: bool,
+    skip_sequence: bool = True,
+    skip_rl: bool = True,
 ) -> int:
     cmd = build_training_command(
         run_id=run_id,
@@ -315,6 +343,8 @@ def run_candidate_training(
         sample_per_symbol=sample_per_symbol,
         batch_size=batch_size,
         resume=resume,
+        skip_sequence=skip_sequence,
+        skip_rl=skip_rl,
     )
     proc = subprocess.run(cmd, cwd=str(ROOT))
     return proc.returncode
@@ -424,8 +454,15 @@ def main() -> None:
     parser.add_argument("--target-long-share-min", type=float, default=0.25)
     parser.add_argument("--target-long-share-max", type=float, default=0.45)
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--skip-sequence", default="true", choices=["true", "false"],
+                        help="Proactively skip PatchTST sequence training (default true)")
+    parser.add_argument("--skip-rl", default="true", choices=["true", "false"],
+                        help="Proactively skip PPO RL training (default true)")
     parser.add_argument("--dry-run", action="store_true", help="Plan grid and ranking only; do not train")
     args = parser.parse_args()
+
+    skip_sequence = args.skip_sequence == "true"
+    skip_rl = args.skip_rl == "true"
 
     sweep_id = args.sweep_id or utc_sweep_id()
     rules = SweepRules(
@@ -455,6 +492,8 @@ def main() -> None:
                     "grid_size": len(grid),
                     "pending_runs": len(pending),
                     "pending_run_ids": [item[2] for item in pending],
+                    "skip_sequence": skip_sequence,
+                    "skip_rl": skip_rl,
                 },
                 indent=2,
             )
@@ -473,6 +512,8 @@ def main() -> None:
                     sample_per_symbol=args.sample_per_symbol,
                     batch_size=args.batch_size,
                     resume=args.retry_failed and artifact_dir.exists(),
+                    skip_sequence=skip_sequence,
+                    skip_rl=skip_rl,
                 )
                 executed += 1
         else:
@@ -490,6 +531,8 @@ def main() -> None:
                             sample_per_symbol=args.sample_per_symbol,
                             batch_size=args.batch_size,
                             resume=args.retry_failed and artifact_dir.exists(),
+                            skip_sequence=skip_sequence,
+                            skip_rl=skip_rl,
                         ),
                     }
                 )

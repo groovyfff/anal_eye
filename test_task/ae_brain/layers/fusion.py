@@ -496,32 +496,28 @@ class FusionLayer:
             probs, ctx, "SHORT", bundle.short_model, publish_threshold=publish_thr
         )
 
+        from ae_brain.layers.side_specialists import resolve_side_specialist_decision
+
+        long_prob = long_pred.p_profitable_calibrated
+        short_prob = short_pred.p_profitable_calibrated
+        decision_name, decision_reason = resolve_side_specialist_decision(
+            long_prob,
+            short_prob,
+            publish_threshold=publish_thr,
+        )
+
         decision = Decision.SKIP
         chosen = None
         sizing = long_sizing
         ev = long_ev
         confidence = 0.0
 
-        long_valid = long_pred.publishable
-        short_valid = short_pred.publishable
-
-        if long_valid and not short_valid:
+        if decision_name == "LONG":
             decision, chosen = Decision.LONG, long_pred
             sizing, ev = long_sizing, long_ev
-        elif short_valid and not long_valid:
+        elif decision_name == "SHORT":
             decision, chosen = Decision.SHORT, short_pred
             sizing, ev = short_sizing, short_ev
-        elif long_valid and short_valid:
-            margin = self._cfg.meta_direction_margin
-            u_l, u_s = long_pred.confidence_adjusted_ev, short_pred.confidence_adjusted_ev
-            if abs(u_l - u_s) < margin * max(u_l, u_s, 1e-9):
-                self._ambiguity_skips += 1
-            elif u_l > u_s:
-                decision, chosen = Decision.LONG, long_pred
-                sizing, ev = long_sizing, long_ev
-            else:
-                decision, chosen = Decision.SHORT, short_pred
-                sizing, ev = short_sizing, short_ev
 
         if chosen is not None:
             confidence = chosen.p_profitable_calibrated
@@ -529,6 +525,8 @@ class FusionLayer:
         components = {
             "decision_source": "side_specialists",
             "side_specialists": {
+                "decision_rule": "calibrated_prob_direct",
+                "decision_reason": decision_reason,
                 "long": {
                     "p_long_profitable_raw": round(long_pred.p_profitable_raw, 6),
                     "p_long_profitable_calibrated": round(long_pred.p_profitable_calibrated, 6),

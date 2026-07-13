@@ -210,6 +210,25 @@ class SideSpecialistsBundle:
         return self.long_model.is_ready() and self.short_model.is_ready()
 
 
+def resolve_side_specialist_decision(
+    long_prob: float,
+    short_prob: float,
+    *,
+    publish_threshold: float = 0.70,
+) -> tuple[str, str | None]:
+    """Production side_specialists direction from calibrated specialist probabilities.
+
+    LONG when long_prob >= threshold and long_prob > short_prob.
+    SHORT when short_prob >= threshold and short_prob > long_prob.
+    SKIP otherwise (including equal qualifying probabilities).
+    """
+    if long_prob >= publish_threshold and long_prob > short_prob:
+        return "LONG", "long_prob_ge_threshold_and_gt_short"
+    if short_prob >= publish_threshold and short_prob > long_prob:
+        return "SHORT", "short_prob_ge_threshold_and_gt_long"
+    return "SKIP", None
+
+
 def load_side_specialists(artifacts_dir: Path) -> SideSpecialistsBundle:
     return SideSpecialistsBundle(
         long_model=SideSpecialistModel("LONG").load(artifacts_dir),

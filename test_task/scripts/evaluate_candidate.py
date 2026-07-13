@@ -31,6 +31,7 @@ from ae_brain.training.evaluation import (
     build_summary_json,
     build_test_metrics_payload,
     evaluate_meta_predictions,
+    side_specialist_collapse_warnings,
     split_label_counts,
 )
 from ae_brain.training.labels import LabelConfig, compute_labels_for_frame, label_distribution_report
@@ -378,6 +379,18 @@ def main() -> None:
         training_metrics=training_metrics,
     )
     summary["success"] = summary["promotable"]
+    if meta_mode == "side_specialists":
+        collapse_warnings = side_specialist_collapse_warnings(
+            artifacts,
+            summary,
+            publish_confidence=args.publish_confidence,
+        )
+        if collapse_warnings:
+            summary.setdefault("warnings", [])
+            for w in collapse_warnings:
+                if w not in summary["warnings"]:
+                    summary["warnings"].append(w)
+        summary["decision_mode"] = "side_specialists_calibrated_prob_direct"
 
     args.report_dir.mkdir(parents=True, exist_ok=True)
     test_metrics_payload = build_test_metrics_payload(backtest_report)

@@ -419,6 +419,8 @@ def _seq_series(module, mean, std, chan_frame, window, device):
 
 def _rl_series(model, X, atr, prices):
     n = len(X)
+    if model is None:
+        return np.zeros(n, dtype=float)
     atr_pct = np.divide(atr, prices, out=np.zeros(n), where=prices > 0)
     extra = np.column_stack([np.zeros(n), np.zeros(n), atr_pct, np.zeros(n)]).astype(np.float32)
     obs = np.concatenate([X.astype(np.float32), extra], axis=1)
@@ -426,13 +428,44 @@ def _rl_series(model, X, atr, prices):
     return np.clip(np.asarray(act).reshape(-1), -1.0, 1.0)
 
 
+def neutral_sequence_stubs(settings: Settings, *, reason: str = "proactive_skip") -> dict:
+    """Neutral sequence outputs used when sequence training is skipped proactively."""
+    return {
+        "seq_module": None,
+        "seq_mean": np.zeros(len(SEQ_CHANNELS), dtype=np.float32),
+        "seq_std": np.ones(len(SEQ_CHANNELS), dtype=np.float32),
+        "seq_device": "cpu",
+        "seq_window": settings.model.sequence_window,
+        "seq_metrics": {"skipped": True, "reason": reason, "val_auc": 0.0},
+    }
+
+
+def neutral_rl_stubs(*, reason: str = "proactive_skip", total_timesteps: int = 0) -> dict:
+    """Neutral RL outputs used when RL training is skipped proactively."""
+    return {
+        "rl_model": None,
+        "rl_metrics": {
+            "skipped": True,
+            "reason": reason,
+            "mean_episode_reward": -1.0,
+            "timesteps": total_timesteps,
+        },
+    }
+
+
 def _build_layer_mask(settings: Settings, seq_metrics: dict, rl_metrics: dict) -> dict[str, bool]:
-    seq_auc = float(seq_metrics.get("val_auc", 0.0) or 0.0)
-    rl_reward = float(rl_metrics.get("mean_episode_reward", -1.0) or -1.0)
+    if seq_metrics.get("skipped"):
+        seq_auc = 0.0
+    else:
+        seq_auc = float(seq_metrics.get("val_auc", 0.0) or 0.0)
+    if rl_metrics.get("skipped"):
+        rl_reward = -1.0
+    else:
+        rl_reward = float(rl_metrics.get("mean_episode_reward", -1.0) or -1.0)
     mask = {
         "tabular": True,
-        "sequence": seq_auc >= settings.fusion.min_sequence_val_auc,
-        "rl": rl_reward >= settings.fusion.min_rl_mean_reward,
+        "sequence": False if seq_metrics.get("skipped") else seq_auc >= settings.fusion.min_sequence_val_auc,
+        "rl": False if rl_metrics.get("skipped") else rl_reward >= settings.fusion.min_rl_mean_reward,
     }
     log.info(
         "train.production.layer_mask",
@@ -577,6 +610,7 @@ def train_side_specialists(
     balance_train_samples: bool = False,
     max_side_train_samples_per_class: int | None = None,
     sequence_skipped: bool = False,
+    rl_skipped: bool = False,
 ):
     """Train independent LONG/SHORT binary specialists; calibrate on validation only."""
     import os
@@ -703,6 +737,7 @@ def train_side_specialists(
         "no_test_leakage": True,
         "apply_regime_filter_at_inference": apply_regime_at_inference,
         "sequence_skipped": sequence_skipped,
+        "rl_skipped": rl_skipped,
     }
     if walk_forward:
         report["walk_forward"] = run_walk_forward_specialists(
@@ -987,6 +1022,8 @@ def train_meta_multi(sym_data, settings, tab_predictor, seq_module, seq_mean, se
         balance_side = _envbool("AEB_BALANCE_SIDE_SPECIALISTS")
         balance_samples = _envbool("AEB_BALANCE_TRAIN_SAMPLES")
         allow_skip_seq = _envbool("AEB_ALLOW_SKIP_SEQUENCE")
+        skip_seq = _envbool("AEB_SKIP_SEQUENCE")
+        skip_rl = _envbool("AEB_SKIP_RL")
 
         long_w_raw = os.environ.get("AEB_LONG_POSITIVE_WEIGHT")
         short_w_raw = os.environ.get("AEB_SHORT_POSITIVE_WEIGHT")
@@ -1016,7 +1053,8 @@ def train_meta_multi(sym_data, settings, tab_predictor, seq_module, seq_mean, se
             short_positive_weight=_parse_weight(short_w_raw),
             balance_train_samples=balance_samples,
             max_side_train_samples_per_class=max_per_int,
-            sequence_skipped=allow_skip_seq and seq_module is None,
+            sequence_skipped=skip_seq or (allow_skip_seq and seq_module is None) or bool(seq_metrics.get("skipped")),
+            rl_skipped=skip_rl or bool(rl_metrics.get("skipped")),
         )
     return train_meta_two_stage(
         sym_data,
@@ -1050,6 +1088,10 @@ def main() -> None:
     parser.add_argument("--allow-skip-sequence", action="store_true",
                         help="Memory-safe: if sequence training is too heavy/fails, skip it and "
                              "continue with tabular + side specialists + regime + calibration.")
+    parser.add_argument("--skip-sequence", default="false", choices=["true", "false"],
+                        help="Proactively skip PatchTST sequence training (avoids OOM/SIGKILL).")
+    parser.add_argument("--skip-rl", default="false", choices=["true", "false"],
+                        help="Proactively skip PPO RL risk-agent training.")
     args = parser.parse_args()
 
     settings = Settings()
@@ -1074,38 +1116,60 @@ def main() -> None:
     print("\n=== [2/4] Sequence (PatchTST + regime channels) ===", flush=True)
     sequence_skipped = False
     seq_metrics: dict = {}
-    try:
-        seq_metrics, seq_module, seq_mean, seq_std, seq_device, seq_window = train_sequence_multi(
-            sym_data, settings, epochs=args.seq_epochs, cap=args.seq_cap, batch_size=args.seq_batch
-        )
-    except (RuntimeError, MemoryError, OSError) as exc:
-        if args.allow_skip_sequence:
-            log.warning("train.production.sequence.skipped", err=str(exc), allow_skip=True)
-            print(f"Sequence training failed ({exc}); --allow-skip-sequence set -> skipping.", flush=True)
-            sequence_skipped = True
-            seq_module = None
-            seq_mean = np.zeros(len(SEQ_CHANNELS), dtype=np.float32)
-            seq_std = np.ones(len(SEQ_CHANNELS), dtype=np.float32)
-            seq_device = "cpu"
-            seq_window = settings.model.sequence_window
-            seq_metrics = {"skipped": True, "reason": str(exc), "val_auc": 0.0}
-        else:
-            raise
-    if sequence_skipped:
-        # The sequence layer is masked off downstream; neutral stubs are used for
-        # the sequence column of the meta-feature vector so specialist features
-        # remain dimensionally valid.
+    proactive_skip_seq = args.skip_sequence == "true"
+    if proactive_skip_seq:
+        stubs = neutral_sequence_stubs(settings, reason="proactive_skip")
+        seq_module = stubs["seq_module"]
+        seq_mean = stubs["seq_mean"]
+        seq_std = stubs["seq_std"]
+        seq_device = stubs["seq_device"]
+        seq_window = stubs["seq_window"]
+        seq_metrics = stubs["seq_metrics"]
+        sequence_skipped = True
         summary["sequence"] = seq_metrics
         summary["sequence_skipped"] = True
-        print("Sequence layer SKIPPED. Continuing with tabular + specialists.", flush=True)
+        print("Sequence layer SKIPPED (--skip-sequence true). Using neutral sequence features.", flush=True)
     else:
-        summary["sequence"] = seq_metrics
-        print(json.dumps(seq_metrics, indent=2, default=str), flush=True)
+        try:
+            seq_metrics, seq_module, seq_mean, seq_std, seq_device, seq_window = train_sequence_multi(
+                sym_data, settings, epochs=args.seq_epochs, cap=args.seq_cap, batch_size=args.seq_batch
+            )
+        except (RuntimeError, MemoryError, OSError) as exc:
+            if args.allow_skip_sequence:
+                log.warning("train.production.sequence.skipped", err=str(exc), allow_skip=True)
+                print(f"Sequence training failed ({exc}); --allow-skip-sequence set -> skipping.", flush=True)
+                stubs = neutral_sequence_stubs(settings, reason=str(exc))
+                seq_module = stubs["seq_module"]
+                seq_mean = stubs["seq_mean"]
+                seq_std = stubs["seq_std"]
+                seq_device = stubs["seq_device"]
+                seq_window = stubs["seq_window"]
+                seq_metrics = stubs["seq_metrics"]
+                sequence_skipped = True
+            else:
+                raise
+        if sequence_skipped:
+            summary["sequence"] = seq_metrics
+            summary["sequence_skipped"] = True
+            print("Sequence layer SKIPPED. Continuing with tabular + specialists.", flush=True)
+        else:
+            summary["sequence"] = seq_metrics
+            print(json.dumps(seq_metrics, indent=2, default=str), flush=True)
 
     print("\n=== [3/4] RL Risk Agent (PPO) ===", flush=True)
-    rl_metrics, rl_model = train_rl_multi(sym_data, settings, total_timesteps=args.rl_timesteps)
-    summary["rl"] = rl_metrics
-    print(json.dumps(rl_metrics, indent=2, default=str), flush=True)
+    rl_skipped = False
+    if args.skip_rl == "true":
+        stubs = neutral_rl_stubs(reason="proactive_skip", total_timesteps=0)
+        rl_metrics = stubs["rl_metrics"]
+        rl_model = stubs["rl_model"]
+        rl_skipped = True
+        summary["rl"] = rl_metrics
+        summary["rl_skipped"] = True
+        print("RL layer SKIPPED (--skip-rl true). Using neutral RL exposure features.", flush=True)
+    else:
+        rl_metrics, rl_model = train_rl_multi(sym_data, settings, total_timesteps=args.rl_timesteps)
+        summary["rl"] = rl_metrics
+        print(json.dumps(rl_metrics, indent=2, default=str), flush=True)
 
     print("\n=== [4/4] Meta-model (two-stage + calibration) ===", flush=True)
     tab_predictor = TabularPredictor(settings.model)

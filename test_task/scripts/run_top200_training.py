@@ -213,6 +213,10 @@ def main() -> None:
     parser.add_argument("--max-side-train-samples-per-class", type=int, default=None)
     parser.add_argument("--allow-skip-sequence", default="true", choices=["true", "false"],
                         help="Memory-safe: skip sequence training if too heavy/fails (default true for top200)")
+    parser.add_argument("--skip-sequence", default="true", choices=["true", "false"],
+                        help="Proactively skip PatchTST sequence training (default true for top200)")
+    parser.add_argument("--skip-rl", default="true", choices=["true", "false"],
+                        help="Proactively skip PPO RL training (default true for top200)")
     parser.add_argument("--skip-download", action="store_true")
     parser.add_argument("--skip-train", action="store_true")
     args = parser.parse_args()
@@ -307,6 +311,10 @@ def main() -> None:
             args.balance_train_samples,
             "--allow-skip-sequence",
             args.allow_skip_sequence,
+            "--skip-sequence",
+            args.skip_sequence,
+            "--skip-rl",
+            args.skip_rl,
             "--skip-evaluate",
         ]
         if args.max_side_train_samples_per_class is not None:
@@ -359,6 +367,13 @@ def main() -> None:
     (reports_dir / "publishable_report.json").write_text(json.dumps(pub_report, indent=2), encoding="utf-8")
 
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {}
+    training_summary_path = artifact_dir / "training_summary.json"
+    if training_summary_path.exists():
+        training_summary = json.loads(training_summary_path.read_text(encoding="utf-8"))
+        if training_summary.get("sequence_skipped"):
+            summary["sequence_skipped"] = True
+        if training_summary.get("rl_skipped"):
+            summary["rl_skipped"] = True
     side_diag = _side_specialists_diagnostic_snapshot(artifact_dir)
     summary["top200_pipeline"] = {
         "run_id": run_id,

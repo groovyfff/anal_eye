@@ -91,6 +91,10 @@ def main() -> None:
                         help="Cap samples per class when balance-train-samples is enabled")
     parser.add_argument("--allow-skip-sequence", default="false", choices=["true", "false"],
                         help="Memory-safe: skip sequence training if it is too heavy or fails")
+    parser.add_argument("--skip-sequence", default="false", choices=["true", "false"],
+                        help="Proactively skip PatchTST sequence training (avoids OOM/SIGKILL)")
+    parser.add_argument("--skip-rl", default="false", choices=["true", "false"],
+                        help="Proactively skip PPO RL risk-agent training")
     parser.add_argument("--skip-evaluate", action="store_true")
     parser.add_argument("--use-mlflow", action="store_true")
     args = parser.parse_args()
@@ -184,6 +188,10 @@ def main() -> None:
             os.environ["AEB_MAX_SIDE_TRAIN_SAMPLES_PER_CLASS"] = str(args.max_side_train_samples_per_class)
     if args.allow_skip_sequence == "true":
         os.environ["AEB_ALLOW_SKIP_SEQUENCE"] = "true"
+    if args.skip_sequence == "true":
+        os.environ["AEB_SKIP_SEQUENCE"] = "true"
+    if args.skip_rl == "true":
+        os.environ["AEB_SKIP_RL"] = "true"
 
     from scripts import train_production as tp
 
@@ -213,6 +221,10 @@ def main() -> None:
         argv.extend(["--sample-per-symbol", str(sample_n)])
     if args.allow_skip_sequence == "true":
         argv.append("--allow-skip-sequence")
+    if args.skip_sequence == "true":
+        argv.extend(["--skip-sequence", "true"])
+    if args.skip_rl == "true":
+        argv.extend(["--skip-rl", "true"])
     # Delegate to existing orchestrator (preserves layer training code).
     sys.argv = ["train_production.py", *argv]
     tp.main()

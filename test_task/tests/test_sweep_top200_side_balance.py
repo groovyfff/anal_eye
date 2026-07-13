@@ -128,6 +128,23 @@ def test_reject_missing_summary_json(tmp_path: Path) -> None:
     assert "summary_json_missing" in result.rejection_reasons
 
 
+def test_reject_sigkill_missing_summary(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "sigkill"
+    logs = artifact_dir / "logs"
+    logs.mkdir(parents=True)
+    (logs / "train.log").write_text("died with <Signals.SIGKILL: 9>\n", encoding="utf-8")
+    result = sweep.evaluate_candidate_result(
+        run_id="sigkill",
+        long_weight=3.1,
+        short_weight=1.5,
+        artifact_dir=artifact_dir,
+        rules=sweep.SweepRules(),
+    )
+    assert result.accepted is False
+    assert "summary_json_missing" in result.rejection_reasons
+    assert "training_sigkill" in result.rejection_reasons
+
+
 def test_reject_side_report_only_candidate(tmp_path: Path) -> None:
     artifact_dir = tmp_path / "side_only"
     artifact_dir.mkdir()
