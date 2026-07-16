@@ -139,11 +139,27 @@ def resolve_binance_symbols(
     quote_asset: str | None = None,
     limit: int | None = None,
 ) -> list[str]:
-    """Resolve symbols from SYMBOLS / BINANCE_SYMBOLS or auto-discover top-N by volume."""
+    """Resolve symbols from SYMBOLS / allowlist env, or auto-discover top-N by volume."""
+    from shared.symbol_universe import resolve_production_symbols
+
     manual = manual_symbols_from_env()
     if manual:
-        logger.info("Using manual Binance symbol list count=%s symbols=%s", len(manual), ",".join(manual[:5]))
-        return manual
+        symbols = resolve_production_symbols(manual)
+        logger.info(
+            "Using manual Binance symbol list count=%s symbols=%s",
+            len(symbols),
+            ",".join(symbols[:5]),
+        )
+        return symbols
+
+    allowed = resolve_production_symbols()
+    if allowed:
+        logger.info(
+            "Using production allowlist for Binance symbols count=%s symbols=%s",
+            len(allowed),
+            ",".join(allowed),
+        )
+        return allowed
 
     rest = (rest_base_url or os.environ.get("BINANCE_REST_BASE_URL") or DEFAULT_REST_BASE_URL).strip().rstrip("/")
     quote = (quote_asset or quote_asset_from_env()).upper()
@@ -157,4 +173,4 @@ def resolve_binance_symbols(
         len(symbols),
         ",".join(symbols[:5]),
     )
-    return symbols
+    return resolve_production_symbols(symbols)

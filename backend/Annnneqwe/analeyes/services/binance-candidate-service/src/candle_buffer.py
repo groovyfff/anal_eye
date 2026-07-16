@@ -13,6 +13,11 @@ class Candle:
     close: float
     volume: float
     closed: bool = True
+    close_time: int = 0
+    quote_volume: float | None = None
+    trades_count: int | None = None
+    taker_buy_base_volume: float | None = None
+    taker_buy_quote_volume: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -22,6 +27,10 @@ class Candle:
             "low": self.low,
             "close": self.close,
             "volume": self.volume,
+            "quote_volume": self.quote_volume,
+            "trades_count": self.trades_count,
+            "taker_buy_base_volume": self.taker_buy_base_volume,
+            "taker_buy_quote_volume": self.taker_buy_quote_volume,
         }
 
 
@@ -54,6 +63,12 @@ class CandleBuffer:
     def latest(self, symbol: str) -> Candle | None:
         rows = self.candles(symbol)
         return rows[-1] if rows else None
+
+    def last_close_time(self, symbol: str) -> int | None:
+        latest = self.latest(symbol)
+        if latest is None:
+            return None
+        return latest.close_time or latest.timestamp
 
     def _trim(self, symbol: str) -> None:
         store = self._by_symbol.get(symbol.upper())

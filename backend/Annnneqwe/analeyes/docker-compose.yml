@@ -7,6 +7,7 @@ networks:
 volumes:
   postgres_data:
   rabbitmq_data:
+  binance_candidate_data:
 
 services:
   rabbitmq:
@@ -77,15 +78,44 @@ services:
       - analeyes-net
     env_file:
       - .env
+
+    restart: unless-stopped
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+
     environment:
       PYTHONPATH: /app
       RABBITMQ_EXCHANGE: analeyes.events
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT}
+      ANAL_EYES_ALLOWED_SYMBOLS: ${ANAL_EYES_ALLOWED_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT}
+      CANDIDATE_TIMEFRAME: ${CANDIDATE_TIMEFRAME:-1h}
+      CANDIDATE_CLOSED_CANDLES_ONLY: ${CANDIDATE_CLOSED_CANDLES_ONLY:-true}
+      CANDIDATE_DEDUP_ENABLED: ${CANDIDATE_DEDUP_ENABLED:-true}
+      CANDIDATE_MIN_INTERVAL_SEC: ${CANDIDATE_MIN_INTERVAL_SEC:-3600}
+      CANDIDATE_WINDOW_CANDLES: ${CANDIDATE_WINDOW_CANDLES:-200}
+      BINANCE_MARKET: ${BINANCE_MARKET:-usdm_futures}
+      ENABLE_LEGACY_PARSER: ${ENABLE_LEGACY_PARSER:-false}
+      ENABLE_HIGH_FREQUENCY_TEST_PARSER: ${ENABLE_HIGH_FREQUENCY_TEST_PARSER:-false}
+      CANDIDATE_CONTINUOUS_TEST_MODE: ${CANDIDATE_CONTINUOUS_TEST_MODE:-false}
+      BINANCE_CANDIDATE_PUBLISH_ON_CANDLE_CLOSE: ${BINANCE_CANDIDATE_PUBLISH_ON_CANDLE_CLOSE:-true}
+      BINANCE_CANDIDATE_PUBLISH_ON_EVERY_UPDATE: ${BINANCE_CANDIDATE_PUBLISH_ON_EVERY_UPDATE:-false}
+      CANDIDATE_WS_IDLE_TIMEOUT_SEC: ${CANDIDATE_WS_IDLE_TIMEOUT_SEC:-60}
+      CANDIDATE_REST_FALLBACK_ENABLED: ${CANDIDATE_REST_FALLBACK_ENABLED:-true}
+      CANDIDATE_REST_FALLBACK_POLL_SEC: ${CANDIDATE_REST_FALLBACK_POLL_SEC:-60}
+      CANDIDATE_REST_FALLBACK_ALWAYS_ON: ${CANDIDATE_REST_FALLBACK_ALWAYS_ON:-true}
+      CANDIDATE_REST_TIMEOUT_SEC: ${CANDIDATE_REST_TIMEOUT_SEC:-10}
+      CANDIDATE_REST_MAX_RETRIES: ${CANDIDATE_REST_MAX_RETRIES:-3}
+      CANDIDATE_REST_RETRY_BACKOFF_SEC: ${CANDIDATE_REST_RETRY_BACKOFF_SEC:-5}
+      CANDIDATE_BACKFILL_PUBLISH_HISTORICAL: ${CANDIDATE_BACKFILL_PUBLISH_HISTORICAL:-false}
+      CANDIDATE_DEDUP_DB_PATH: /app/data/candidate_dedup.db
     depends_on:
       rabbitmq-bootstrap:
         condition: service_completed_successfully
     volumes:
       - ./shared:/app/shared
       - ./services/binance-candidate-service/src:/app/src
+      - binance_candidate_data:/app/data
 
   binance-live-price-service:
     build:
@@ -177,6 +207,20 @@ services:
     environment:
       PYTHONPATH: /app
       RABBITMQ_EXCHANGE: analeyes.events
+      ANAL_EYES_ALLOWED_SYMBOLS: ${ANAL_EYES_ALLOWED_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,DOGEUSDT}
+      NOTIFICATION_MIN_CONFIDENCE: ${NOTIFICATION_MIN_CONFIDENCE:-0.70}
+      NOTIFICATION_SEND_SKIPPED_DECISIONS: ${NOTIFICATION_SEND_SKIPPED_DECISIONS:-false}
+      SIGNAL_PRESENTATION_LLM_ENABLED: ${SIGNAL_PRESENTATION_LLM_ENABLED:-false}
+      SIGNAL_PRESENTATION_PROVIDER: ${SIGNAL_PRESENTATION_PROVIDER:-openrouter}
+      SIGNAL_PRESENTATION_MODEL: ${SIGNAL_PRESENTATION_MODEL:-x-ai/grok-4.3}
+      SIGNAL_PRESENTATION_BASE_URL: ${SIGNAL_PRESENTATION_BASE_URL:-https://openrouter.ai/api/v1}
+      SIGNAL_PRESENTATION_API_KEY: ${SIGNAL_PRESENTATION_API_KEY:-${OPENROUTER_API_KEY}}
+      SIGNAL_PRESENTATION_TIMEOUT_SEC: ${SIGNAL_PRESENTATION_TIMEOUT_SEC:-15}
+      SIGNAL_PRESENTATION_MAX_RETRIES: ${SIGNAL_PRESENTATION_MAX_RETRIES:-2}
+      SIGNAL_PRESENTATION_MAX_COMMENT_CHARS: ${SIGNAL_PRESENTATION_MAX_COMMENT_CHARS:-220}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-x-ai/grok-4.3}
     depends_on:
       postgres:
         condition: service_healthy
@@ -207,3 +251,43 @@ services:
     volumes:
       - ./config:/app/config
       - ./shared:/app/shared
+
+
+  news-service:
+    build:
+      context: ../../../news-service/news-sentiment-service
+      dockerfile: Dockerfile
+    image: analeyes-news-service:latest
+    container_name: analeyes-news-service-1
+    env_file:
+      - .env
+    networks:
+      - analeyes-net
+    restart: unless-stopped
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      rabbitmq-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_USER: ${RABBITMQ_USER:-analeyes}
+      RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD:-analeyes_dev_secret}
+      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-analeyes}
+      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-analeyes.events}
+
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-openai/gpt-4o-mini}
+      OPENROUTER_TIMEOUT_SEC: ${OPENROUTER_TIMEOUT_SEC:-30}
+      OPENROUTER_MAX_RETRIES: ${OPENROUTER_MAX_RETRIES:-3}
+      OPENROUTER_RETRY_BACKOFF_SEC: ${OPENROUTER_RETRY_BACKOFF_SEC:-5}
+
+      NEWS_ANALYSIS_ENABLED: ${NEWS_ANALYSIS_ENABLED:-true}
+      NEWS_SIGNAL_ENABLED: ${NEWS_SIGNAL_ENABLED:-true}
+      NEWS_SIGNAL_EXCHANGE: ${NEWS_SIGNAL_EXCHANGE:-analeyes.events}
+      NEWS_SIGNAL_ROUTING_KEY: ${NEWS_SIGNAL_ROUTING_KEY:-news.market_signal}
+      NEWS_SIGNAL_QUEUE: ${NEWS_SIGNAL_QUEUE:-q_news_market_signal}
+      NEWS_MIN_RELEVANCE: ${NEWS_MIN_RELEVANCE:-0.65}
+      NEWS_MIN_CONFIDENCE: ${NEWS_MIN_CONFIDENCE:-0.50}

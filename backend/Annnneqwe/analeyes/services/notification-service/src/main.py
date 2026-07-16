@@ -530,9 +530,11 @@ class NotificationServiceApp:
             source_ai,
         )
         logger.info(
-            "Telegram config token_present=%s group_id_present=%s",
+            "Telegram config token_present=%s group_id_present=%s allowed_symbols=%s min_confidence=%s",
             bool(self.sender.bot_token),
             bool(self.sender.group_id),
+            ",".join(sorted(self.sender.allowed_symbols)),
+            self.sender.min_confidence,
         )
         topic_id = self.sender.resolve_topic_id(normalized.get("asset_class"), source_ai)
         logger.info(

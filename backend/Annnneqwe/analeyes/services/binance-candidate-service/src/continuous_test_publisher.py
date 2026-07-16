@@ -1,13 +1,14 @@
-"""DEV/TEST continuous candidate publisher (round-robin, in-memory buffers only)."""
+"""DEV/TEST high-frequency publisher — disabled in production (ENABLE_HIGH_FREQUENCY_TEST_PARSER)."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 from src.candle_buffer import CandleBuffer
-from src.candidate_builder import build_candidate_payload
 from src.config import ServiceConfig
+from src.converters.ae_brain_candidate import build_ae_brain_candidate
 from src.publisher import CandidatePublisher
 
 logger = logging.getLogger(__name__)
@@ -20,19 +21,18 @@ async def run_continuous_test_publisher(
     publisher: CandidatePublisher,
     stop_event: asyncio.Event,
 ) -> None:
-    if not config.continuous_test_mode:
+    if not (config.enable_high_frequency_test_parser or config.continuous_test_mode):
         return
 
-    interval_sec = config.emit_interval_ms / 1000.0
+    interval_ms = int(os.environ.get("CANDIDATE_EMIT_INTERVAL_MS", "200"))
+    interval_sec = interval_ms / 1000.0
     symbols = list(config.symbols)
     index = 0
 
-    logger.info(
-        "continuous_test_mode enabled interval_ms=%s symbols=%s round_robin=%s require_min_candles=%s",
-        config.emit_interval_ms,
+    logger.warning(
+        "high_frequency_test_parser enabled interval_ms=%s symbols=%s — NOT for production",
+        interval_ms,
         len(symbols),
-        config.emit_round_robin,
-        config.emit_require_min_candles,
     )
 
     while not stop_event.is_set():
@@ -44,42 +44,31 @@ async def run_continuous_test_publisher(
             break
 
         symbol = symbols[index % len(symbols)]
-        if config.emit_round_robin:
-            index += 1
+        index += 1
 
-        count = buffer.count(symbol)
-        if config.emit_require_min_candles and count < config.min_candles:
-            logger.info(
-                "continuous_test_skip symbol=%s reason=not_enough_candles count=%s min=%s",
-                symbol,
-                count,
-                config.min_candles,
-            )
-        elif count == 0:
-            logger.info("continuous_test_skip symbol=%s reason=missing_buffer", symbol)
+        latest = buffer.latest(symbol)
+        candles = buffer.candles(symbol)
+        if latest is None or len(candles) < config.window_candles:
+            logger.info("high_frequency_test_skip symbol=%s reason=window_not_ready", symbol)
         else:
-            latest = buffer.latest(symbol)
-            candles = buffer.candles(symbol)
-            if latest is None:
-                logger.info("continuous_test_skip symbol=%s reason=missing_buffer", symbol)
+            closed = latest
+            closed.closed = True
+            payload = build_ae_brain_candidate(
+                symbol=symbol,
+                timeframe=config.timeframe,
+                candles=candles,
+                closed_candle=closed,
+                market=config.market,
+                window_candles=config.window_candles,
+            )
+            if payload is None:
+                logger.info("high_frequency_test_skip symbol=%s reason=converter_returned_none", symbol)
             else:
                 try:
-                    payload = build_candidate_payload(
-                        symbol=symbol,
-                        market=config.market,
-                        timeframe=config.timeframe,
-                        event_time=latest.timestamp,
-                        candles=candles,
-                    )
                     await publisher.publish_candidate(payload)
-                    logger.info(
-                        "continuous_test_publish symbol=%s interval_ms=%s candles=%s",
-                        symbol,
-                        config.emit_interval_ms,
-                        len(candles),
-                    )
+                    logger.info("high_frequency_test_publish symbol=%s candles=%s", symbol, len(candles))
                 except ValueError as exc:
-                    logger.info("continuous_test_skip symbol=%s reason=%s", symbol, exc)
+                    logger.info("high_frequency_test_skip symbol=%s reason=%s", symbol, exc)
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval_sec)

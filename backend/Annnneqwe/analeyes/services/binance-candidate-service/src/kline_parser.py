@@ -16,6 +16,10 @@ class ParsedKline:
     close: float
     volume: float
     is_closed: bool
+    quote_volume: float | None = None
+    trades_count: int | None = None
+    taker_buy_base_volume: float | None = None
+    taker_buy_quote_volume: float | None = None
     raw_stream: str | None = None
 
 
@@ -53,6 +57,10 @@ def parse_kline_message(
         close = float(k["c"])
         volume = float(k["v"])
         is_closed = bool(k.get("x"))
+        quote_volume = float(k["q"]) if k.get("q") is not None else None
+        trades_count = int(k["n"]) if k.get("n") is not None else None
+        taker_buy_base_volume = float(k["V"]) if k.get("V") is not None else None
+        taker_buy_quote_volume = float(k["Q"]) if k.get("Q") is not None else None
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid kline fields: {exc}") from exc
 
@@ -71,5 +79,9 @@ def parse_kline_message(
         close=close,
         volume=volume,
         is_closed=is_closed,
+        quote_volume=quote_volume,
+        trades_count=trades_count,
+        taker_buy_base_volume=taker_buy_base_volume,
+        taker_buy_quote_volume=taker_buy_quote_volume,
         raw_stream=raw_stream,
     )

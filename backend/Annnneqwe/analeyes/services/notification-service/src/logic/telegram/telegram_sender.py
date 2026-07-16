@@ -16,6 +16,11 @@ import matplotlib.pyplot as plt
 import mplfinance as mpf
 import pandas as pd
 
+from shared.symbol_universe import default_allowed_symbols
+
+from src.formatting.signal_presenter import SignalPresenter
+from src.logic.telegram.telegram_gate import evaluate_telegram_signal, log_telegram_rejection
+
 logger = logging.getLogger(__name__)
 
 NON_ACTIONABLE_DECISIONS = frozenset(
@@ -96,8 +101,21 @@ class TelegramSender:
         self._disable_dedup_in_test_mode = os.environ.get(
             "NOTIFICATION_DISABLE_DEDUP_IN_TEST_MODE", "false"
         ).strip().lower() in {"1", "true", "yes", "on"}
-        self._send_queue: asyncio.Queue[tuple[str, dict[str, Any], asyncio.Future[Any]]] | None = None
+        self.allowed_symbols = default_allowed_symbols()
+        raw_min = os.environ.get("NOTIFICATION_MIN_CONFIDENCE") or os.environ.get(
+            "AEB_MIN_PUBLISH_CONFIDENCE", "0.70"
+        )
+        try:
+            self.min_confidence = float(str(raw_min).strip())
+            if self.min_confidence > 1.0:
+                self.min_confidence = self.min_confidence / 100.0
+        except (TypeError, ValueError):
+            self.min_confidence = 0.70
+        self._send_queue: asyncio.Queue[
+            tuple[str, dict[str, Any], asyncio.Future[Any], dict[str, Any] | None]
+        ] | None = None
         self._send_worker_task: asyncio.Task[None] | None = None
+        self._presenter = SignalPresenter()
 
     def start_send_worker(self) -> None:
         """Start the single sequential Telegram send worker (200 ms between sends)."""
@@ -114,9 +132,12 @@ class TelegramSender:
         assert self._send_queue is not None
         interval_sec = self._send_interval_ms / 1000.0
         while True:
-            method, payload, future = await self._send_queue.get()
+            method, payload, future, files = await self._send_queue.get()
             try:
-                result = await self._post_telegram_direct(method, payload)
+                if files:
+                    result = await self._post_telegram_multipart(method, payload, files)
+                else:
+                    result = await self._post_telegram_direct(method, payload)
                 if not future.done():
                     future.set_result(result)
             except Exception as exc:
@@ -133,16 +154,25 @@ class TelegramSender:
                 await asyncio.sleep(interval_sec)
                 self._send_queue.task_done()
 
-    async def _enqueue_post_telegram(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async def _enqueue_post_telegram(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        files: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         logger.info(
-            "telegram_enqueue chat_id=%s",
+            "telegram_enqueue method=%s chat_id=%s",
+            method,
             payload.get("chat_id"),
         )
         if self._send_queue is None:
+            if files:
+                return await self._post_telegram_multipart(method, payload, files)
             return await self._post_telegram_direct(method, payload)
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
-        await self._send_queue.put((method, payload, future))
+        await self._send_queue.put((method, payload, future, files))
         return await future
 
     @staticmethod
@@ -206,7 +236,7 @@ class TelegramSender:
             return f"no forum topic mapping for source_ai={source_ai!r} (set TELEGRAM_ALLOW_NO_TOPIC=true to send without topic)"
         return None
 
-    def _build_message_payload(self, text: str, topic_id: int | None) -> dict[str, Any]:
+    def _build_text_message_payload(self, text: str, topic_id: int | None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "chat_id": self.group_id,
             "text": text,
@@ -215,6 +245,18 @@ class TelegramSender:
         if topic_id is not None:
             payload["message_thread_id"] = topic_id
         return payload
+
+    def _build_photo_payload(self, caption: str, topic_id: int | None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "chat_id": self.group_id,
+            "caption": caption,
+        }
+        if topic_id is not None:
+            payload["message_thread_id"] = topic_id
+        return payload
+
+    def _build_message_payload(self, text: str, topic_id: int | None) -> dict[str, Any]:
+        return self._build_text_message_payload(text, topic_id)
 
     async def _post_telegram_direct(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
@@ -280,6 +322,44 @@ class TelegramSender:
                 await asyncio.sleep(min(2 ** attempt, 10))
 
         logger.exception("Telegram %s failed after %d attempts", method, self.retry_attempts)
+        raise TelegramDeliveryError(f"Telegram {method} failed after {self.retry_attempts} attempts") from last_exc
+
+    async def _post_telegram_multipart(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        files: dict[str, Any],
+    ) -> dict[str, Any]:
+        url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
+        last_exc: Exception | None = None
+        logger.info(
+            "telegram_send_attempt method=%s chat_id=%s multipart=true",
+            method,
+            payload.get("chat_id"),
+        )
+        for attempt in range(1, self.retry_attempts + 1):
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(url, data=payload, files=files)
+                    response.raise_for_status()
+                    data = response.json()
+                    if not data.get("ok"):
+                        desc = data.get("description", data)
+                        logger.error("Telegram API %s rejected: %s", method, desc)
+                        raise TelegramDeliveryError(f"Telegram API {method} rejected: {desc}")
+                    logger.info(
+                        "telegram_send_success method=%s chat_id=%s",
+                        method,
+                        payload.get("chat_id"),
+                    )
+                    return data
+            except TelegramDeliveryError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                logger.exception("Telegram %s multipart failed (attempt %d/%d)", method, attempt, self.retry_attempts)
+            if attempt < self.retry_attempts:
+                await asyncio.sleep(min(2 ** attempt, 10))
         raise TelegramDeliveryError(f"Telegram {method} failed after {self.retry_attempts} attempts") from last_exc
 
     def _format_signal_message(self, payload: dict[str, Any]) -> str:
@@ -357,6 +437,15 @@ class TelegramSender:
         decision = payload.get("decision")
         topic_id = self.resolve_topic_id(payload.get("asset_class"), source_ai)
 
+        gate_ok, gate_reason = evaluate_telegram_signal(
+            payload,
+            allowed_symbols=self.allowed_symbols,
+            min_confidence=self.min_confidence,
+        )
+        if not gate_ok:
+            log_telegram_rejection(payload, gate_reason or "gate_rejected")
+            return SendResult(sent=False, skip_reason=gate_reason)
+
         skip = self._skip_reason(source_ai, topic_id)
         if skip:
             logger.info(
@@ -382,16 +471,25 @@ class TelegramSender:
             decision,
         )
 
-        text = self._format_signal_message(payload)
-        chart = self._generate_signal_chart_image(payload)
-        if chart is None and payload.get("historical_ohlcv"):
-            logger.info(
-                "Chart generation skipped/disabled for symbol=%s (optional)",
-                symbol,
-            )
+        presented = await self._presenter.present(payload)
+        caption = presented.caption
+        chart = presented.chart_bytes
 
         try:
-            await self._enqueue_post_telegram("sendMessage", self._build_message_payload(text, topic_id))
+            if chart:
+                photo_payload = self._build_photo_payload(caption, topic_id)
+                files = {"photo": ("chart.png", chart, "image/png")}
+                await self._enqueue_post_telegram("sendPhoto", photo_payload, files=files)
+                logger.info("telegram_photo_sent symbol=%s decision=%s topic_id=%s", symbol, decision, topic_id)
+            else:
+                plain_payload: dict[str, Any] = {
+                    "chat_id": self.group_id,
+                    "text": caption,
+                }
+                if topic_id is not None:
+                    plain_payload["message_thread_id"] = topic_id
+                await self._enqueue_post_telegram("sendMessage", plain_payload)
+                logger.info("telegram_text_sent symbol=%s decision=%s topic_id=%s", symbol, decision, topic_id)
         except TelegramDeliveryError:
             logger.exception(
                 "Telegram API failed for signal symbol=%s decision=%s source_ai=%s",
