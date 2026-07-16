@@ -390,6 +390,7 @@ def main() -> None:
             for w in collapse_warnings:
                 if w not in summary["warnings"]:
                     summary["warnings"].append(w)
+            summary["side_specialist_collapse_detected"] = True
         summary["decision_mode"] = "side_specialists_calibrated_prob_direct"
 
     args.report_dir.mkdir(parents=True, exist_ok=True)
@@ -399,10 +400,33 @@ def main() -> None:
         encoding="utf-8",
     )
     (artifacts / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    # Keep reports/publishable_report.json in sync with summary when re-running evaluate only.
+    reports_dir = artifacts / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    publishable_report = {
+        "publish_confidence": args.publish_confidence,
+        "publishable_long_count_ge_70": int(summary.get("publishable_long_count_ge_70", 0)),
+        "publishable_short_count_ge_70": int(summary.get("publishable_short_count_ge_70", 0)),
+        "publishable_long_ev_ge_70": float(summary.get("publishable_long_ev_ge_70", 0.0)),
+        "publishable_short_ev_ge_70": float(summary.get("publishable_short_ev_ge_70", 0.0)),
+        "publishable_total_ev_ge_70": float(summary.get("publishable_total_ev_ge_70", 0.0)),
+        "publishable_total_trade_count_ge_70": int(summary.get("publishable_total_trade_count_ge_70", 0)),
+        "decision_mode": summary.get("decision_mode"),
+    }
+    (reports_dir / "publishable_report.json").write_text(
+        json.dumps(publishable_report, indent=2), encoding="utf-8"
+    )
     (args.report_dir / f"backtest_{args.run_id}.json").write_text(json.dumps(backtest_report, indent=2), encoding="utf-8")
     (args.report_dir / f"diagnose_{args.run_id}.json").write_text(json.dumps(diagnose_report, indent=2), encoding="utf-8")
 
     print(json.dumps(summary, indent=2))
+    if meta_mode == "side_specialists" and summary.get("side_specialist_collapse_detected"):
+        print(
+            "SIDE_SPECIALIST_COLLAPSE:",
+            [w for w in summary.get("warnings", []) if "collapse" in w],
+            file=sys.stderr,
+        )
+        sys.exit(3)
     if not summary["promotable"]:
         print("NOT PROMOTABLE:", summary["promotion_blockers"], file=sys.stderr)
         sys.exit(2)

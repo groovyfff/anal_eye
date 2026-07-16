@@ -473,8 +473,8 @@ class FusionLayer:
             return filtered
 
         bundle = self._side_specialists
-        publish_thr = 0.70
-        if bundle is None or not getattr(bundle, "is_ready", lambda: False)():
+        publish_thr = 0.45
+        if bundle is None or not getattr(bundle, "is_ready", lambda: False)()):
             return FinalSignal(
                 symbol=ctx.symbol,
                 decision=Decision.SKIP,
@@ -496,17 +496,13 @@ class FusionLayer:
             probs, ctx, "SHORT", bundle.short_model, publish_threshold=publish_thr
         )
 
-        from ae_brain.training.side_specialist_decisions import decision_from_calibrated_probs
+        from ae_brain.layers.side_specialists import resolve_side_specialist_decision
 
         long_prob = long_pred.p_profitable_calibrated
         short_prob = short_pred.p_profitable_calibrated
-        # Direction from calibrated specialist probs. CostModel EV is only used for
-        # tie-break when both EVs are strictly positive; otherwise higher probability.
-        decision_name, decision_reason = decision_from_calibrated_probs(
+        decision_name, decision_reason = resolve_side_specialist_decision(
             long_prob,
             short_prob,
-            long_ev=long_pred.ev_usd,
-            short_ev=short_pred.ev_usd,
             publish_threshold=publish_thr,
         )
 
@@ -526,26 +522,6 @@ class FusionLayer:
         if chosen is not None:
             confidence = chosen.p_profitable_calibrated
 
-        long_sizing_blob = {
-            "position_size_pct": long_sizing.position_size_pct,
-            "leverage": long_sizing.leverage,
-            "take_profit": long_sizing.take_profit,
-            "stop_loss": long_sizing.stop_loss,
-            "kelly_fraction_raw": long_sizing.kelly_fraction_raw,
-            "correlation_scale": long_sizing.correlation_scale,
-            "notional_usd": long_sizing.notional_usd,
-            "rejected_reason": long_sizing.rejected_reason,
-        }
-        short_sizing_blob = {
-            "position_size_pct": short_sizing.position_size_pct,
-            "leverage": short_sizing.leverage,
-            "take_profit": short_sizing.take_profit,
-            "stop_loss": short_sizing.stop_loss,
-            "kelly_fraction_raw": short_sizing.kelly_fraction_raw,
-            "correlation_scale": short_sizing.correlation_scale,
-            "notional_usd": short_sizing.notional_usd,
-            "rejected_reason": short_sizing.rejected_reason,
-        }
         components = {
             "decision_source": "side_specialists",
             "side_specialists": {
@@ -556,14 +532,12 @@ class FusionLayer:
                     "p_long_profitable_calibrated": round(long_pred.p_profitable_calibrated, 6),
                     "ev_long": round(long_pred.ev_usd, 4),
                     **long_pred.to_dict(),
-                    "sizing": long_sizing_blob,
                 },
                 "short": {
                     "p_short_profitable_raw": round(short_pred.p_profitable_raw, 6),
                     "p_short_profitable_calibrated": round(short_pred.p_profitable_calibrated, 6),
                     "ev_short": round(short_pred.ev_usd, 4),
                     **short_pred.to_dict(),
-                    "sizing": short_sizing_blob,
                 },
                 "chosen_side": chosen.side if chosen else None,
             },

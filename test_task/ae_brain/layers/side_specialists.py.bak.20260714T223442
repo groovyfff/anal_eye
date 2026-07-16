@@ -198,7 +198,6 @@ class SideSpecialistModel:
         self._scaler = blob["scaler"]
         self._clf = blob["clf"]
         self._metrics = blob.get("metrics", {})
-        self._feature_names = blob.get("feature_names") or list(META_INPUT_NAMES)
         return self
 
 
@@ -216,39 +215,18 @@ def resolve_side_specialist_decision(
     short_prob: float,
     *,
     publish_threshold: float = 0.70,
-    long_ev: float | None = None,
-    short_ev: float | None = None,
 ) -> tuple[str, str | None]:
     """Production side_specialists direction from calibrated specialist probabilities.
 
-    • LONG when long_prob >= threshold and (only long qualifies OR wins tie-break).
-    • SHORT when short_prob >= threshold and (only short qualifies OR wins tie-break).
-    • When both qualify: tie-break by expected EV; if EV unavailable/equal, higher prob.
-    • SKIP when neither side meets the threshold, or both qualify with equal prob and EV.
+    LONG when long_prob >= threshold and long_prob > short_prob.
+    SHORT when short_prob >= threshold and short_prob > long_prob.
+    SKIP otherwise (including equal qualifying probabilities).
     """
-    long_ok = long_prob >= publish_threshold
-    short_ok = short_prob >= publish_threshold
-
-    if not long_ok and not short_ok:
-        return "SKIP", None
-
-    if long_ok and not short_ok:
-        return "LONG", "long_prob_ge_threshold"
-
-    if short_ok and not long_ok:
-        return "SHORT", "short_prob_ge_threshold"
-
-    # Both sides >= publish threshold.
-    if long_ev is not None and short_ev is not None and long_ev != short_ev:
-        if long_ev > short_ev:
-            return "LONG", "both_qualify_ev_tiebreak_long"
-        return "SHORT", "both_qualify_ev_tiebreak_short"
-
-    if long_prob > short_prob:
+    if long_prob >= publish_threshold and long_prob > short_prob:
         return "LONG", "long_prob_ge_threshold_and_gt_short"
-    if short_prob > long_prob:
+    if short_prob >= publish_threshold and short_prob > long_prob:
         return "SHORT", "short_prob_ge_threshold_and_gt_long"
-    return "SKIP", "both_qualify_equal_prob_skip"
+    return "SKIP", None
 
 
 def load_side_specialists(artifacts_dir: Path) -> SideSpecialistsBundle:

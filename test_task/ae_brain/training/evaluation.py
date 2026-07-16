@@ -464,10 +464,14 @@ def side_specialist_collapse_warnings(
     if pub_long > 0 and pub_short == 0:
         warnings.append(
             "side_specialists_validation_both_sides_but_final_summary_long_only_collapse"
+            f": diagnostic_SHORT_ge_{publish_confidence:.2f}={diag_short}"
+            f" final_SHORT={pub_short} final_LONG={pub_long}"
         )
     elif pub_short > 0 and pub_long == 0:
         warnings.append(
             "side_specialists_validation_both_sides_but_final_summary_short_only_collapse"
+            f": diagnostic_LONG_ge_{publish_confidence:.2f}={diag_long}"
+            f" final_LONG={pub_long} final_SHORT={pub_short}"
         )
     return warnings
 
